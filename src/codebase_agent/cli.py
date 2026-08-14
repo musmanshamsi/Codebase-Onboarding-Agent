@@ -1,6 +1,6 @@
 """CLI entry point for Codebase Onboarding Agent (FR-7.1)."""
 
-import os
+import json
 import sys
 import time
 from pathlib import Path
@@ -8,6 +8,7 @@ import click
 
 from codebase_agent.config import IngestionConfig
 from codebase_agent.ingestion.manager import IngestionManager
+from codebase_agent.parser.ast_parser import Parser
 from codebase_agent.storage.metadata_cache import MetadataCache
 
 
@@ -46,7 +47,6 @@ def index(repo: str, dry_run: bool, full: bool):
         click.echo(f"Discovered source files: {len(discovered)}")
 
         if full:
-            # Force re-indexing of all discovered files
             to_process = [
                 {
                     "abs_path": str(abs_p),
@@ -119,6 +119,41 @@ def index(repo: str, dry_run: bool, full: bool):
 
     finally:
         manager.cleanup()
+
+
+@main.command()
+@click.option("--file", "-f", required=True, help="Path to source code file to parse.")
+@click.option("--json-out", is_flag=True, help="Output raw JSON structure.")
+def parse(file: str, json_out: bool):
+    """Parse a single source file and display extracted symbols, imports, and call sites (FR-2)."""
+    parser = Parser()
+    result = parser.parse_file(file_path=file)
+
+    if json_out:
+        click.echo(result.model_dump_json(indent=2))
+        return
+
+    click.echo(f"=== Parse Results: {file} ===")
+    click.echo(f"Status: {result.parse_status}")
+    if result.parse_status == "failed":
+        click.echo(f"Error: {result.error_message}", err=True)
+        return
+
+    click.echo(f"\nSymbols Extracted ({len(result.symbols)}):")
+    for sym in result.symbols:
+        click.echo(f"  - [{sym.type.value.upper()}] {sym.name} (Lines {sym.start_line}-{sym.end_line}) -> ID: {sym.id}")
+
+    click.echo(f"\nImport Statements ({len(result.imports)}):")
+    for imp in result.imports:
+        symbols_str = ", ".join(imp.imported_symbols) if imp.imported_symbols else "*"
+        alias_str = f" as {imp.alias_map}" if imp.alias_map else ""
+        rel_str = f" (relative level {imp.level})" if imp.is_relative else ""
+        click.echo(f"  - Line {imp.line_number}: from '{imp.source_module}' import [{symbols_str}]{alias_str}{rel_str}")
+
+    click.echo(f"\nCall Sites ({len(result.call_sites)}):")
+    for cs in result.call_sites:
+        caller = cs.caller_symbol_id or "global"
+        click.echo(f"  - Line {cs.line_number}: call {cs.function_name}() inside caller '{caller}' (args: {cs.args_count})")
 
 
 if __name__ == "__main__":
