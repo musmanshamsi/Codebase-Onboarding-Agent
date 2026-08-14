@@ -9,9 +9,12 @@ import click
 from codebase_agent.config import IngestionConfig
 from codebase_agent.graph.builder import GraphBuilder
 from codebase_agent.graph.store import GraphStore
+from codebase_agent.indexing.chunker import Chunker
+from codebase_agent.indexing.embedder import Embedder
 from codebase_agent.ingestion.manager import IngestionManager
 from codebase_agent.parser.ast_parser import Parser
 from codebase_agent.storage.metadata_cache import MetadataCache
+from codebase_agent.storage.store_writer import StoreWriter
 
 
 @click.group()
@@ -22,12 +25,12 @@ def main():
 
 @main.command()
 @click.option("--repo", "-r", default=".", help="Path to local repository or remote Git URL.")
-@click.option("--dry-run", is_flag=True, help="Perform discovery and parsing without updating database or graph.")
+@click.option("--dry-run", is_flag=True, help="Perform discovery, parsing, chunking without updating DB or vector store.")
 @click.option("--full", is_flag=True, help="Force full re-indexing instead of incremental diff.")
 def index(repo: str, dry_run: bool, full: bool):
-    """Index a code repository (Phases 1-3: Ingestion, Parsing, Graph)."""
+    """Index a code repository (Phases 1-4: Ingestion, Parsing, Graph, Vector Embeddings)."""
     start_time = time.time()
-    click.echo(f"=== Codebase Indexing (Phases 1-3) ===")
+    click.echo(f"=== Codebase Indexing (Phases 1-4) ===")
     click.echo(f"Target repository: {repo}")
     click.echo(f"Mode: {'Dry-Run' if dry_run else 'Full Index' if full else 'Incremental'}")
 
@@ -45,9 +48,11 @@ def index(repo: str, dry_run: bool, full: bool):
         index_dir = repo_root / config.index_dir_name
         db_path = index_dir / "cache.db"
         graph_path = index_dir / "graph" / "repo_graph.graphml"
+        chroma_dir = index_dir / "chroma"
 
         cache = MetadataCache(db_path=db_path)
         parser = Parser()
+        chunker = Chunker()
 
         discovered = manager.discover_files()
         click.echo(f"Discovered source files: {len(discovered)}")
@@ -69,8 +74,9 @@ def index(repo: str, dry_run: bool, full: bool):
         click.echo(f"Files to process (new/changed): {len(to_process)}")
         click.echo(f"Files to remove: {len(to_delete)}")
 
-        # --- Phase 2: AST Parsing across all discovered files ---
+        # --- Phase 2 & Phase 4: AST Parsing & Syntax Chunking ---
         all_parse_results = {}
+        all_chunks = []
         processed_count = 0
         failed_count = 0
 
@@ -82,13 +88,43 @@ def index(repo: str, dry_run: bool, full: bool):
             else:
                 failed_count += 1
 
+            # Chunk file if included in to_process
+            is_new_or_changed = any(item["rel_path"] == rel_p for item in to_process)
+            if is_new_or_changed and res.parse_status == "success":
+                try:
+                    with open(abs_p, "r", encoding="utf-8", errors="replace") as f:
+                        src_text = f.read()
+                    c_hash = manager.compute_content_hash(abs_p)
+                    f_chunks = chunker.chunk_file(
+                        file_path=rel_p,
+                        source_code=src_text,
+                        parse_result=res,
+                        content_hash=c_hash
+                    )
+                    all_chunks.extend(f_chunks)
+                except Exception as ex:
+                    click.echo(f"Error chunking file {rel_p}: {ex}", err=True)
+
         total_symbols = sum(len(r.symbols) for r in all_parse_results.values())
         click.echo(f"Parsed files: {len(all_parse_results)} ({total_symbols} symbols extracted)")
+        click.echo(f"Generated chunks to embed: {len(all_chunks)}")
 
         # --- Phase 3: Graph Construction ---
         graph_builder = GraphBuilder()
         G = graph_builder.build_graph(all_parse_results)
         click.echo(f"Knowledge Graph Built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+
+        # --- Phase 4: Embedding & Vector Storage ---
+        if all_chunks and not dry_run:
+            click.echo("Generating local embeddings via SentenceTransformers...")
+            embedder = Embedder()
+            embedder.embed_chunks(all_chunks)
+
+            store_writer = StoreWriter(chroma_dir=chroma_dir)
+            store_writer.upsert_chunks(all_chunks)
+
+            for del_path in to_delete:
+                store_writer.delete_file_chunks(del_path)
 
         if not dry_run:
             run_id = cache.start_index_run(run_type="full" if full else "incremental")
@@ -118,13 +154,13 @@ def index(repo: str, dry_run: bool, full: bool):
                 status="completed"
             )
 
-            # Persist GraphML
             GraphStore.save_graph(G, graph_path)
 
             click.echo("\n--- Indexing Output Summary ---")
             click.echo(f"Run ID: {run_id}")
             click.echo(f"SQLite Cache: {db_path}")
             click.echo(f"GraphML Store: {graph_path}")
+            click.echo(f"ChromaDB Store: {chroma_dir}")
 
         elapsed = time.time() - start_time
         click.echo(f"\nIndexing pipeline completed in {elapsed:.3f} seconds.")
@@ -221,6 +257,42 @@ def graph_query(repo: str, node: str, relation: str):
         for n_id in sorted(neighbors):
             n_data = G.nodes.get(n_id, {})
             click.echo(f"  - {n_id} (Type: {n_data.get('type', 'unknown')})")
+
+
+@main.group()
+def store():
+    """Vector Store Subcommands (FR-4.4)."""
+    pass
+
+
+@store.command("inspect")
+@click.option("--repo", "-r", default=".", help="Path to repository.")
+@click.option("--collection", "-c", default="codebase_chunks", help="ChromaDB collection name.")
+def store_inspect(repo: str, collection: str):
+    """Inspect ChromaDB collection status, total chunks, vector dimension, and sample metadata (FR-4.4)."""
+    config = IngestionConfig()
+    chroma_dir = Path(repo) / config.index_dir_name / "chroma"
+
+    if not chroma_dir.exists():
+        click.echo(f"ChromaDB directory not found at {chroma_dir}. Please run 'index' first.", err=True)
+        sys.exit(1)
+
+    writer = StoreWriter(chroma_dir=chroma_dir)
+    info = writer.inspect_collection()
+
+    click.echo(f"=== Vector Store Inspection: {info['collection_name']} ===")
+    click.echo(f"Storage Path: {info['chroma_dir']}")
+    click.echo(f"Total Chunks Stored: {info['total_chunks']}")
+    click.echo(f"Vector Dimension: {info['dimension'] or 'N/A'}")
+
+    sample = info.get("sample_record")
+    if sample:
+        click.echo("\n--- Sample Chunk Record ---")
+        click.echo(f"Chunk ID: {sample['id']}")
+        click.echo(f"Document Snippet (first 100 chars): {repr(sample['document'][:100])}")
+        click.echo("Metadata Fields:")
+        for k, v in sample["metadata"].items():
+            click.echo(f"  - {k}: {v}")
 
 
 if __name__ == "__main__":
