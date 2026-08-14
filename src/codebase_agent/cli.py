@@ -13,6 +13,9 @@ from codebase_agent.indexing.chunker import Chunker
 from codebase_agent.indexing.embedder import Embedder
 from codebase_agent.ingestion.manager import IngestionManager
 from codebase_agent.parser.ast_parser import Parser
+from codebase_agent.retrieval.context_assembler import ContextAssembler
+from codebase_agent.retrieval.graph_expander import GraphExpander
+from codebase_agent.retrieval.vector_retriever import VectorRetriever
 from codebase_agent.storage.metadata_cache import MetadataCache
 from codebase_agent.storage.store_writer import StoreWriter
 
@@ -74,7 +77,6 @@ def index(repo: str, dry_run: bool, full: bool):
         click.echo(f"Files to process (new/changed): {len(to_process)}")
         click.echo(f"Files to remove: {len(to_delete)}")
 
-        # --- Phase 2 & Phase 4: AST Parsing & Syntax Chunking ---
         all_parse_results = {}
         all_chunks = []
         processed_count = 0
@@ -88,7 +90,6 @@ def index(repo: str, dry_run: bool, full: bool):
             else:
                 failed_count += 1
 
-            # Chunk file if included in to_process
             is_new_or_changed = any(item["rel_path"] == rel_p for item in to_process)
             if is_new_or_changed and res.parse_status == "success":
                 try:
@@ -109,12 +110,10 @@ def index(repo: str, dry_run: bool, full: bool):
         click.echo(f"Parsed files: {len(all_parse_results)} ({total_symbols} symbols extracted)")
         click.echo(f"Generated chunks to embed: {len(all_chunks)}")
 
-        # --- Phase 3: Graph Construction ---
         graph_builder = GraphBuilder()
         G = graph_builder.build_graph(all_parse_results)
         click.echo(f"Knowledge Graph Built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
-        # --- Phase 4: Embedding & Vector Storage ---
         if all_chunks and not dry_run:
             click.echo("Generating local embeddings via SentenceTransformers...")
             embedder = Embedder()
@@ -293,6 +292,54 @@ def store_inspect(repo: str, collection: str):
         click.echo("Metadata Fields:")
         for k, v in sample["metadata"].items():
             click.echo(f"  - {k}: {v}")
+
+
+@main.command()
+@click.argument("query_text")
+@click.option("--repo", "-r", default=".", help="Path to repository.")
+@click.option("--top-k", "-k", default=3, help="Top semantic vector matches count.")
+@click.option("--hops", default=1, help="Structural graph expansion hops.")
+@click.option("--threshold", default=0.3, help="Minimum similarity threshold score.")
+def retrieve(query_text: str, repo: str, top_k: int, hops: int, threshold: float):
+    """Perform hybrid retrieval (semantic search + graph expansion + context assembly) (FR-5.1 - FR-5.3, FR-5.6)."""
+    config = IngestionConfig()
+    index_dir = Path(repo) / config.index_dir_name
+    chroma_dir = index_dir / "chroma"
+    graph_path = index_dir / "graph" / "repo_graph.graphml"
+
+    if not chroma_dir.exists() or not graph_path.exists():
+        click.echo(f"Index directories missing at {index_dir}. Please run 'index' first.", err=True)
+        sys.exit(1)
+
+    retriever = VectorRetriever(chroma_dir=chroma_dir)
+    expander = GraphExpander(chroma_dir=chroma_dir)
+    assembler = ContextAssembler(max_context_tokens=4096, similarity_threshold=threshold)
+
+    G = GraphStore.load_graph(graph_path)
+
+    # 1. Top-K Semantic Search (FR-5.2)
+    semantic_chunks = retriever.retrieve(query_text=query_text, top_k=top_k)
+
+    # 2. Structural Graph Expansion (FR-5.3)
+    expanded_chunks = expander.expand(semantic_chunks=semantic_chunks, G=G, hops=hops)
+
+    # 3. Context Assembly & Sufficiency Check (FR-5.6, Algorithm 3.7)
+    result = assembler.assemble(query=query_text, semantic_chunks=semantic_chunks, expanded_chunks=expanded_chunks)
+
+    click.echo(f"=== Hybrid Retrieval Engine Output ===")
+    click.echo(f"Query: '{query_text}'")
+    click.echo(f"Sufficient Context: {'YES' if result.sufficient_context else 'NO'}")
+
+    if not result.sufficient_context:
+        click.echo(f"\n[INSUFFICIENT CONTEXT WARNING]: {result.message}")
+        return
+
+    click.echo(f"Assembled Context Tokens: ~{result.total_tokens} tokens")
+    click.echo(f"\nFinal Assembled Chunks ({len(result.final_context_chunks)}):")
+    for idx, chunk in enumerate(result.final_context_chunks, 1):
+        click.echo(f"\n[{idx}] {chunk.file_path}:{chunk.start_line}-{chunk.end_line} (Source: {chunk.source}, Score: {chunk.similarity_score})")
+        click.echo(f"    Graph Node ID: {chunk.graph_node_id}")
+        click.echo(f"    Snippet: {repr(chunk.document[:80])}...")
 
 
 if __name__ == "__main__":
