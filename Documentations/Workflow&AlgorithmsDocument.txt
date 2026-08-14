@@ -1,0 +1,314 @@
+# Workflow & Algorithms Document
+## Codebase Onboarding Agent
+
+| Field | Value |
+|---|---|
+| Document Version | 1.0 |
+| Status | Draft |
+| Companion Documents | FRD, Tech Stack, Architecture, Database Design |
+| Last Updated | 2026-08-13 |
+
+---
+
+## 1. Project Background
+
+### 1.1 The Problem
+New developers joining an existing codebase typically spend days to weeks reading code, asking senior teammates repetitive questions, and manually tracing how functions call into each other before they can make a confident change. This "ramp-up tax" is paid every time someone joins a project — a new hire, an open-source contributor, or even the original author returning to old code after months away.
+
+### 1.2 Why Existing Tools Fall Short
+- **Plain-text search** (grep, IDE search) finds where a name appears, not how pieces of the system relate.
+- **Generic RAG chatbots over docs** answer from documentation, which is often outdated or missing — not from the code itself.
+- **Plain vector-search-over-code tools** retrieve code that *looks* similar in wording, but miss code that is *structurally* connected (a function three calls deep in the chain, with no shared vocabulary).
+
+### 1.3 The Approach
+This project combines two retrieval strategies that are individually incomplete but complementary together:
+1. **Semantic retrieval** (vector embeddings) — finds code that *means* something similar to the question.
+2. **Structural retrieval** (a code knowledge graph) — finds code that is *actually connected* to what the semantic search found, via real calls/imports/inheritance.
+
+The result is an agent that answers "how does X work" not by guessing from wording similarity alone, but by following the actual structure of the program — then citing exact files and line numbers so answers are independently verifiable, never just trusted blindly.
+
+### 1.4 Constraints Driving Every Decision
+- Zero paid APIs or services — every model and store must run locally (Ollama for the LLM, local embedding models, embedded databases).
+- Must run on a standard developer laptop, not a server cluster.
+- Must degrade gracefully — a single unparseable file or an unanswerable question should never crash the system or produce a fabricated answer.
+
+---
+
+## 2. Agent Workflow — Step by Step
+
+The agent operates in two modes, as established in the Architecture document. Below is the full step-by-step walkthrough of each, now expressed as an operational sequence rather than a component diagram.
+
+### 2.1 Indexing Workflow (run once, then incrementally)
+
+**Step 1 — Discover files**
+The agent walks the repository directory tree, applying include/exclude rules (`.gitignore`-style patterns), and produces a list of candidate source files. Binary and minified files are filtered out.
+
+**Step 2 — Hash and compare**
+For each candidate file, the agent computes a content hash (SHA-256) and compares it to the hash stored from the last run (in the SQLite cache). Files with unchanged hashes are skipped entirely — this is what makes re-indexing incremental rather than full every time.
+
+**Step 3 — Parse changed files**
+Each new or changed file is parsed into an Abstract Syntax Tree using tree-sitter. From the AST, the agent extracts: function/method/class definitions, import statements, and call sites — each with exact line ranges.
+
+**Step 4 — Build/update the graph**
+Extracted symbols become nodes; relationships between them (calls, imports, inherits_from, defined_in) become edges. Where a call site can be statically resolved to its definition, the edge is marked resolved; where it can't (e.g., dynamic dispatch), it's marked unresolved but still recorded.
+
+**Step 5 — Chunk the code**
+Each file is split into embedding-ready chunks aligned to function/class boundaries — never splitting a function in half — using a syntax-aware chunker.
+
+**Step 6 — Embed each chunk**
+Every chunk is passed through a local embedding model, producing a vector that captures its semantic meaning.
+
+**Step 7 — Persist everything**
+- Chunk text + embedding + metadata (file path, line range, graph node ID) → vector store
+- Updated nodes/edges → graph store
+- New file hash + parse status → metadata cache
+
+**Step 8 — Report**
+The agent reports what changed: files processed, symbols extracted, any parse failures, and total time taken.
+
+### 2.2 Query Workflow (interactive, per question)
+
+**Step 1 — Receive the question**
+The user types a natural-language question via CLI or web UI (e.g., *"How does the payment flow work?"*).
+
+**Step 2 — Embed the question**
+The question is run through the same embedding model used during indexing, producing a query vector in the same vector space as the code chunks.
+
+**Step 3 — Semantic retrieval**
+The vector store is searched for the top-K chunks whose embeddings are closest to the query vector — these are the pieces of code that are *semantically* about the question.
+
+**Step 4 — Structural expansion**
+For each retrieved chunk, the agent looks up its corresponding graph node and pulls in its direct neighbors — functions that call it, functions it calls, and modules it imports from. This step is what lets the agent answer questions about flow and impact, not just "what looks related."
+
+**Step 5 — Assemble context**
+Retrieved and expanded chunks are deduplicated, ranked, and trimmed to fit within the LLM's context window, each tagged with its file path and line range so the citation trail is preserved.
+
+**Step 6 — Check sufficiency**
+If the best matches fall below a similarity/relevance threshold, the agent skips generation and reports it cannot find relevant code — rather than letting the LLM improvise.
+
+**Step 7 — Generate the answer**
+The assembled context plus the original question are sent to a local LLM (via Ollama), with an explicit instruction to answer only from the provided context.
+
+**Step 8 — Attach citations and return**
+The final response pairs the LLM's answer with the exact file paths and line ranges it drew from, so the developer can verify the answer against real code immediately.
+
+### 2.3 Incremental Re-Index Workflow (triggered automatically)
+
+**Step 1** — A git hook (e.g., `post-merge`) fires after a pull/merge.
+**Step 2** — The agent re-hashes all tracked files and diffs against the SQLite cache.
+**Step 3** — Only changed, added, or deleted files are processed: changed/added files go through Steps 3–7 of the Indexing Workflow; deleted files have their nodes, edges, and vector entries removed from all three stores.
+**Step 4** — The graph is updated to reflect only the edges touching changed files, not rebuilt from scratch.
+
+---
+
+## 3. Core Algorithms
+
+### 3.1 Symbol Extraction (AST Walk)
+
+Recursive tree traversal over the tree-sitter parse tree, collecting symbol nodes by type.
+
+```
+function extract_symbols(node, file_path, symbols=[]):
+    if node.type in ["function_definition", "class_definition", "method_definition"]:
+        symbols.append({
+            name: get_node_name(node),
+            type: node.type,
+            file_path: file_path,
+            start_line: node.start_point.row,
+            end_line: node.end_point.row
+        })
+    if node.type == "import_statement":
+        symbols.append(parse_import(node, file_path))
+    if node.type == "call_expression":
+        symbols.append(parse_call_site(node, file_path))
+
+    for child in node.children:
+        extract_symbols(child, file_path, symbols)
+
+    return symbols
+```
+**Complexity:** O(n) per file, where n = number of AST nodes. Runs once per file per index/re-index.
+
+### 3.2 Call-Site Resolution
+
+Maps a call site (e.g., `charge_card(...)`) to the function definition it most likely refers to, using import context to disambiguate.
+
+```
+function resolve_call(call_site, file_symbol_table, import_map):
+    called_name = call_site.function_name
+
+    # 1. Same-file definition takes priority
+    if called_name in file_symbol_table:
+        return file_symbol_table[called_name]
+
+    # 2. Check imports for the file the symbol came from
+    if called_name in import_map:
+        source_module = import_map[called_name]
+        return lookup_definition(source_module, called_name)
+
+    # 3. Cannot resolve statically (dynamic dispatch, reflection, etc.)
+    return UNRESOLVED
+```
+**Complexity:** O(1) average per call site with a precomputed symbol/import index; O(m) worst case where m = number of candidate modules if resolution requires a broader search.
+
+### 3.3 Graph Construction
+
+Builds the directed graph incrementally, one file's extracted symbols at a time.
+
+```
+function build_graph(all_file_symbols):
+    G = empty_directed_graph()
+
+    # Pass 1: add all nodes first (files, classes, functions)
+    for file_symbols in all_file_symbols:
+        for symbol in file_symbols:
+            G.add_node(symbol.id, type=symbol.type, ...)
+
+    # Pass 2: add edges (requires all nodes to exist for resolution)
+    for file_symbols in all_file_symbols:
+        for call_site in file_symbols.calls:
+            target = resolve_call(call_site, ...)
+            if target != UNRESOLVED:
+                G.add_edge(call_site.caller_id, target.id, relation="calls", resolved=true)
+            else:
+                G.add_edge(call_site.caller_id, call_site.raw_name, relation="calls", resolved=false)
+
+    return G
+```
+**Why two passes:** call resolution (Pass 2) may reference symbols defined in files processed earlier or later in iteration order — all nodes must exist before any edges are resolved.
+**Complexity:** O(V + E) where V = symbols, E = relationships — linear in codebase size.
+
+### 3.4 Semantic Chunking
+
+Splits a file into chunks aligned to symbol boundaries rather than fixed line counts.
+
+```
+function chunk_file(file_text, symbols, max_chunk_lines=40, overlap=10):
+    chunks = []
+    for symbol in symbols where symbol.type in [function, method, class]:
+        chunk_text = extract_lines(file_text, symbol.start_line, symbol.end_line)
+
+        if length(chunk_text) > max_chunk_lines:
+            # split large functions into overlapping sub-chunks,
+            # still snapped to nearest logical boundary (e.g., blank lines)
+            sub_chunks = split_with_overlap(chunk_text, max_chunk_lines, overlap)
+            chunks.extend(sub_chunks)
+        else:
+            chunks.append(chunk_text)
+
+    return chunks
+```
+**Complexity:** O(n) per file, n = lines of code.
+
+### 3.5 Semantic Retrieval (Vector Search)
+
+Standard approximate nearest-neighbor search over embeddings, handled by ChromaDB internally (HNSW index), but conceptually:
+
+```
+function semantic_retrieve(query_text, top_k):
+    query_vector = embed(query_text)
+    results = vector_store.search(query_vector, k=top_k)
+    return results  # ranked by cosine similarity
+```
+**Complexity:** Sub-linear per query due to ChromaDB's HNSW (Hierarchical Navigable Small World) index — approximately O(log n) versus O(n) for brute-force comparison against every stored vector.
+
+### 3.6 Graph Expansion Algorithm
+
+The core differentiator: takes the semantically retrieved chunks and pulls in their structural neighborhood (1-hop by default, configurable).
+
+```
+function graph_expand(retrieved_chunks, graph, hops=1):
+    expanded = set(retrieved_chunks)
+
+    frontier = [chunk.graph_node_id for chunk in retrieved_chunks]
+
+    for hop in range(hops):
+        next_frontier = []
+        for node_id in frontier:
+            callers = graph.predecessors(node_id, relation="calls")
+            callees = graph.successors(node_id, relation="calls")
+            importers = graph.predecessors(node_id, relation="imports")
+
+            neighbors = callers + callees + importers
+            for n in neighbors:
+                if n not in expanded:
+                    expanded.add(n)
+                    next_frontier.append(n)
+        frontier = next_frontier
+
+    return fetch_chunks_for_nodes(expanded)
+```
+**Why 1-hop by default:** deeper hops (2+) risk pulling in loosely-related code and blowing the LLM's context window. 1-hop captures direct cause/effect relationships, which covers the large majority of "how does X work" and "what calls X" questions. Hop count is configurable per FR-8.
+**Complexity:** O(d) per retrieved chunk, where d = average node degree (number of direct relationships) — cheap relative to the embedding/generation steps.
+
+### 3.7 Context Assembly (Dedup + Budget Fit)
+
+```
+function assemble_context(expanded_chunks, max_tokens):
+    deduped = remove_duplicate_chunks(expanded_chunks)
+    ranked = sort_by(deduped, key=relevance_score, descending=true)
+
+    context = []
+    token_count = 0
+    for chunk in ranked:
+        chunk_tokens = estimate_tokens(chunk.text)
+        if token_count + chunk_tokens > max_tokens:
+            break
+        context.append(chunk)
+        token_count += chunk_tokens
+
+    return context
+```
+**Complexity:** O(n log n) for the sort, n = number of expanded chunks (typically small, tens not thousands).
+
+### 3.8 Incremental Diff Algorithm
+
+Determines what actually needs re-processing on a re-index.
+
+```
+function diff_for_reindex(current_files, cached_hashes):
+    to_process = []
+    to_delete = []
+
+    current_hashes = {f: hash(read(f)) for f in current_files}
+
+    for file_path, new_hash in current_hashes.items():
+        old_hash = cached_hashes.get(file_path)
+        if old_hash is None or old_hash != new_hash:
+            to_process.append(file_path)   # new or changed
+
+    for file_path in cached_hashes:
+        if file_path not in current_hashes:
+            to_delete.append(file_path)    # removed from repo
+
+    return to_process, to_delete
+```
+**Complexity:** O(n) where n = total tracked files — a simple hash comparison, not a content diff, so it stays fast even on large repos.
+
+---
+
+## 4. End-to-End Example (Concrete Trace)
+
+**Question:** *"How does the payment flow work?"*
+
+1. Question embedded → vector `[0.02, -0.11, ...]`
+2. Vector search returns top-3 chunks: `payments.py::process_payment`, `checkout.py::checkout_handler`, `stripe_client.py::charge_card` (matched on semantic similarity to "payment").
+3. Graph expansion (1-hop) adds: `order.py::Order.mark_paid` (called by `process_payment`), `routes.py::/checkout POST handler` (calls `checkout_handler`).
+4. Context assembled: 5 chunks total, ~1,200 tokens, well within budget.
+5. Sufficiency check passes (all chunks above relevance threshold).
+6. LLM (`qwen2.5-coder:7b` via Ollama) generates: *"The checkout route calls `checkout_handler`, which invokes `process_payment`. This charges the card via Stripe's client, then marks the order as paid."*
+7. Citations attached: `routes.py:44-46`, `checkout.py:12-30`, `payments.py:12-34`, `stripe_client.py:5-20`, `order.py:88-92`.
+8. Developer reads the answer, opens the cited lines, confirms it firsthand — no blind trust required.
+
+---
+
+## 5. Mapping to Prior Documents
+
+| This Document | Architecture Doc | FRD |
+|---|---|---|
+| Indexing Workflow (2.1) | Index Pipeline (Section 3, 5) | FR-1 through FR-4 |
+| Query Workflow (2.2) | Query Pipeline (Section 3, 6) | FR-5 |
+| Incremental Re-Index Workflow (2.3) | Section 7 | FR-6 |
+| Algorithms 3.1–3.4 | Parser, Graph Builder, Chunker | FR-2, FR-3, FR-4 |
+| Algorithms 3.5–3.7 | Vector Retriever, Graph Expander, Context Assembler | FR-5 |
+| Algorithm 3.8 | Ingestion Manager (incremental path) | FR-6.1 |

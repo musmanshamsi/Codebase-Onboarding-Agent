@@ -1,0 +1,267 @@
+# Database Design Document
+## Codebase Onboarding Agent
+
+| Field | Value |
+|---|---|
+| Document Version | 1.0 |
+| Status | Draft |
+| Companion Documents | FRD_Codebase_Onboarding_Agent.md, Tech_Stack_Codebase_Onboarding_Agent.md, Architecture_Codebase_Onboarding_Agent.md |
+| Last Updated | 2026-08-13 |
+
+---
+
+## 1. Purpose
+
+This document specifies the concrete schema, storage layout, and access patterns for the three persistent stores defined in the Architecture Document (Section 8): the vector store, the graph store, and the metadata cache. It is the level of detail needed to actually implement the Store Writer, Vector Retriever, and Graph Expander components.
+
+## 2. Storage Overview
+
+All three stores live under a single directory local to the indexed repo, keeping the index portable and disposable:
+
+```
+<repo_root>/.agent_index/
+├── chroma/              # ChromaDB persistent collection
+├── graph/
+│   └── repo_graph.graphml
+└── cache.db             # SQLite metadata cache
+```
+
+This directory is added to `.gitignore` by default (it's a derived artifact, not source of truth — it can always be rebuilt from the repo itself).
+
+No separate database server is required for any of the three stores (see Tech Stack doc, Section 4, for why server-based alternatives like Neo4j/Qdrant were not chosen for MVP).
+
+---
+
+## 3. Store 1: Vector Store (ChromaDB)
+
+### 3.1 Purpose
+Stores one entry per code chunk: its embedding vector, its raw text, and enough metadata to render a citation and cross-reference the graph.
+
+### 3.2 Collection
+
+A single collection per indexed repo: `codebase_chunks`.
+
+### 3.3 Record Schema
+
+Each record in the collection has three parts, per Chroma's model — `id`, `embedding`, `document`, `metadata`:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | string | Unique chunk ID. Format: `{file_path}::{symbol_name}::{start_line}` |
+| `embedding` | float[] | Vector produced by the embedding model (dimension depends on model, e.g., 384 for bge-small) |
+| `document` | string | The raw chunk text (the actual code) |
+| `metadata.file_path` | string | Path relative to repo root, e.g., `app/services/payments.py` |
+| `metadata.symbol_name` | string | Function/class/method name, e.g., `process_payment` |
+| `metadata.symbol_type` | string | One of: `function`, `method`, `class`, `module` |
+| `metadata.start_line` | int | Start line in source file |
+| `metadata.end_line` | int | End line in source file |
+| `metadata.language` | string | e.g., `python` |
+| `metadata.graph_node_id` | string | Foreign key into the graph store — same ID scheme as graph nodes (Section 4.3) |
+| `metadata.content_hash` | string | Hash of the chunk's source content, used to detect staleness during incremental re-index |
+| `metadata.last_indexed_at` | string (ISO 8601) | Timestamp of last embedding |
+
+### 3.4 Example Record
+
+```json
+{
+  "id": "app/services/payments.py::process_payment::12",
+  "embedding": [0.0123, -0.0456, ...],
+  "document": "def process_payment(order_id, amount):\n    ...",
+  "metadata": {
+    "file_path": "app/services/payments.py",
+    "symbol_name": "process_payment",
+    "symbol_type": "function",
+    "start_line": 12,
+    "end_line": 34,
+    "language": "python",
+    "graph_node_id": "app/services/payments.py::process_payment",
+    "content_hash": "a3f5e9...",
+    "last_indexed_at": "2026-08-13T10:15:00Z"
+  }
+}
+```
+
+### 3.5 Access Patterns
+
+| Operation | Method |
+|---|---|
+| Top-K semantic search | `collection.query(query_embeddings=[...], n_results=K)` |
+| Upsert on re-index | `collection.upsert(ids=[...], embeddings=[...], documents=[...], metadatas=[...])` |
+| Delete on file removal | `collection.delete(where={"file_path": "<path>"})` |
+| Fetch by graph node ID (for graph-expansion lookups) | `collection.get(where={"graph_node_id": {"$in": [...]}})` |
+
+---
+
+## 4. Store 2: Graph Store (GraphML, via NetworkX)
+
+### 4.1 Purpose
+Stores the structural relationships between code entities — what calls what, what imports what, what inherits from what — enabling the Graph Expander to answer questions vector search alone cannot.
+
+### 4.2 Node Schema
+
+| Attribute | Type | Description |
+|---|---|---|
+| `id` | string | Unique node ID. Scheme: `{file_path}` for files, `{file_path}::{symbol_name}` for functions/classes/methods |
+| `type` | string | One of: `file`, `class`, `function`, `method` |
+| `name` | string | Symbol name (unqualified) |
+| `file_path` | string | Owning file, relative to repo root |
+| `start_line` | int | (omitted for `file`-type nodes) |
+| `end_line` | int | (omitted for `file`-type nodes) |
+| `language` | string | e.g., `python` |
+
+### 4.3 Node ID Scheme (shared with Vector Store for joinability)
+
+```
+File node:      app/services/payments.py
+Function node:  app/services/payments.py::process_payment
+Method node:    app/models/order.py::Order.save
+Class node:     app/models/order.py::Order
+```
+
+This shared scheme is what lets the Vector Retriever hand off directly to the Graph Expander without a separate lookup table.
+
+### 4.4 Edge Schema
+
+| Attribute | Type | Description |
+|---|---|---|
+| `source` | string | Source node ID |
+| `target` | string | Target node ID |
+| `relation` | string | One of: `imports`, `calls`, `inherits_from`, `defined_in` |
+| `resolved` | bool | `true` if statically resolved; `false` if the target is inferred/ambiguous (e.g., dynamic dispatch) |
+
+### 4.5 Example (GraphML conceptually represented as edge list)
+
+```
+app/services/payments.py::process_payment
+   --[calls, resolved=true]--> app/clients/stripe_client.py::charge_card
+
+app/services/payments.py::process_payment
+   --[defined_in]--> app/services/payments.py
+
+app/routes/checkout.py::checkout_handler
+   --[calls, resolved=true]--> app/services/payments.py::process_payment
+
+app/models/order.py::Order
+   --[inherits_from, resolved=true]--> app/models/base.py::BaseModel
+```
+
+### 4.6 Access Patterns
+
+| Operation | Method |
+|---|---|
+| Get direct callers of a function | `G.predecessors(node_id)` filtered by `relation == "calls"` |
+| Get direct callees of a function | `G.successors(node_id)` filtered by `relation == "calls"` |
+| Get full import chain for a file | `nx.descendants(G, file_node_id)` filtered by `relation == "imports"` |
+| Get class hierarchy | traverse `inherits_from` edges recursively |
+| Persist after update | `nx.write_graphml(G, "repo_graph.graphml")` |
+| Load on startup | `nx.read_graphml("repo_graph.graphml")` |
+
+### 4.7 Scaling Note
+
+For repos where NetworkX's in-memory graph becomes a performance bottleneck (per NFR-2/NFR-3), the same node/edge schema above is designed to map directly onto `Kùzu` (embedded graph DB) tables without a schema redesign — see Tech Stack doc, Section 2.3.
+
+---
+
+## 5. Store 3: Metadata Cache (SQLite)
+
+### 5.1 Purpose
+Tracks per-file state to make incremental re-indexing possible (FR-6) without re-parsing the entire repository on every change.
+
+### 5.2 Table: `file_index_state`
+
+| Column | Type | Description |
+|---|---|---|
+| `file_path` | TEXT (PK) | Path relative to repo root |
+| `content_hash` | TEXT | SHA-256 of file contents at last index |
+| `language` | TEXT | Detected language |
+| `last_indexed_at` | TEXT (ISO 8601) | Timestamp of last successful index |
+| `symbol_count` | INTEGER | Number of symbols extracted (diagnostic/reporting use) |
+| `parse_status` | TEXT | One of: `success`, `failed`, `skipped` |
+| `parse_error` | TEXT (nullable) | Error message if `parse_status = 'failed'` |
+
+### 5.3 Table: `index_runs`
+
+| Column | Type | Description |
+|---|---|---|
+| `run_id` | INTEGER (PK, autoincrement) | Unique run identifier |
+| `run_type` | TEXT | `full` or `incremental` |
+| `started_at` | TEXT (ISO 8601) | Run start time |
+| `completed_at` | TEXT (ISO 8601, nullable) | Run end time |
+| `files_processed` | INTEGER | Count of files touched in this run |
+| `files_failed` | INTEGER | Count of parse failures |
+| `status` | TEXT | `running`, `completed`, `failed` |
+
+Purpose: gives the CLI something to report ("last indexed 2 hours ago, 3 files failed to parse") and supports debugging/audit per NFR-6.
+
+### 5.4 Table: `query_log` (optional, for retrieval quality improvement)
+
+| Column | Type | Description |
+|---|---|---|
+| `query_id` | INTEGER (PK, autoincrement) | Unique query identifier |
+| `question` | TEXT | User's natural-language question |
+| `asked_at` | TEXT (ISO 8601) | Timestamp |
+| `top_k_chunk_ids` | TEXT (JSON array) | Chunk IDs returned by vector search |
+| `graph_expanded_ids` | TEXT (JSON array) | Additional chunk IDs pulled in via graph expansion |
+| `answer_returned` | TEXT | Final LLM answer text |
+| `insufficient_context` | BOOLEAN | Whether the system reported it couldn't answer (FR-5.6) |
+
+This table is opt-in (disable via config, FR-8) since it stores question history locally — no data leaves the machine, but users should be able to turn it off.
+
+### 5.5 Access Patterns
+
+| Operation | Query shape |
+|---|---|
+| Diff check on incremental re-index | `SELECT file_path, content_hash FROM file_index_state` compared against freshly computed hashes |
+| Mark file as updated | `INSERT OR REPLACE INTO file_index_state (...)` |
+| Remove deleted file's record | `DELETE FROM file_index_state WHERE file_path = ?` |
+| Report last run status | `SELECT * FROM index_runs ORDER BY started_at DESC LIMIT 1` |
+
+---
+
+## 6. Cross-Store Referential Integrity
+
+Since there are three independent stores rather than one relational database, referential integrity is maintained by convention, not foreign-key constraints:
+
+| Relationship | Enforcement Strategy |
+|---|---|
+| Vector chunk ↔ Graph node | Shared ID scheme (Section 4.3); `graph_node_id` in Chroma metadata must match a node ID in the graph store |
+| Graph node ↔ Source file | `file_path` on every graph node must match a `file_path` in `file_index_state` |
+| Deleted file cleanup | On file deletion, Store Writer must perform all three removals together: Chroma `delete(where={"file_path": ...})`, graph node/edge removal, and `DELETE FROM file_index_state` — treated as a single logical transaction at the application level |
+
+**Design implication:** the Store Writer component (Architecture doc, Section 4.6) is the only component permitted to write to any store. This centralizes the responsibility for keeping the three stores consistent, rather than spreading multi-store writes across the codebase.
+
+---
+
+## 7. Data Volume Estimates (for capacity planning)
+
+Based on a mid-sized repo (~50,000 LOC, ~2,000 functions/classes):
+
+| Store | Estimated Size |
+|---|---|
+| ChromaDB (embeddings + text + metadata) | ~50–150 MB (dominated by embedding vectors; 384-dim float32 ≈ 1.5KB/vector × 2,000 chunks ≈ 3MB for vectors alone, plus stored text/metadata) |
+| Graph store (GraphML) | ~1–5 MB (text-based edge list, scales with symbol + relationship count) |
+| SQLite cache | <5 MB (one row per file, lightweight) |
+
+These are well within the "runs on a developer laptop" constraint (NFR-2).
+
+---
+
+## 8. Migration / Rebuild Strategy
+
+Because `.agent_index/` is fully derived from the source repo, there is no formal schema migration process for early versions — a schema change is handled by:
+
+1. Bumping an internal `schema_version` value stored in `index_runs` (or a dedicated `schema_meta` table).
+2. On mismatch between stored `schema_version` and the running code's expected version, prompting a full re-index rather than attempting an in-place migration.
+
+This is an intentional simplification appropriate for a local developer tool — the cost of a full rebuild (minutes) is much lower than the cost of maintaining migration scripts across three heterogeneous stores.
+
+---
+
+## 9. Mapping to Architecture & FRD
+
+| Database Design Section | Architecture Component | FRD Requirement |
+|---|---|---|
+| Vector Store (Section 3) | Embedder, Store Writer, Vector Retriever | FR-4, FR-5.2 |
+| Graph Store (Section 4) | Graph Builder, Graph Expander | FR-3, FR-5.3 |
+| Metadata Cache (Section 5) | Ingestion Manager, Store Writer | FR-6 |
+| Cross-store integrity (Section 6) | Store Writer (sole writer) | NFR-6 |

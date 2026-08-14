@@ -1,0 +1,238 @@
+# Architecture Document
+## Codebase Onboarding Agent
+
+| Field | Value |
+|---|---|
+| Document Version | 1.0 |
+| Status | Draft |
+| Companion Documents | FRD_Codebase_Onboarding_Agent.md, Tech_Stack_Codebase_Onboarding_Agent.md |
+| Last Updated | 2026-08-13 |
+
+---
+
+## 1. Purpose
+
+This document describes the technical architecture of the Codebase Onboarding Agent: its components, how data flows between them, how state is stored, and the key design decisions behind that structure. It's the bridge between the FRD (what the system must do) and actual implementation (how it's built).
+
+---
+
+## 2. Architectural Style
+
+The system is a **local, single-process, pipeline-oriented RAG (Retrieval-Augmented Generation) application** with a graph-augmented retrieval layer. It is not a distributed system and does not require a server beyond what each embedded library manages internally (ChromaDB and Ollama both run as local processes).
+
+Two distinct execution modes exist:
+
+- **Index mode** — a batch pipeline that runs once (full index) or incrementally (on repo changes). Ingests code, produces the graph and vector store.
+- **Query mode** — an interactive request/response loop. Takes a natural-language question, retrieves context, and generates an answer.
+
+These modes share the same underlying stores (graph + vector index) but have different data flows, described separately below.
+
+---
+
+## 3. High-Level Component Diagram
+
+```
+                          ┌─────────────────────┐
+                          │   User (CLI / Web)   │
+                          └──────────┬───────────┘
+                                     │
+                     ┌───────────────┴───────────────┐
+                     │                                │
+              index <repo>                    query "<question>"
+                     │                                │
+                     ▼                                ▼
+        ┌────────────────────────┐      ┌────────────────────────────┐
+        │      INDEX PIPELINE     │      │       QUERY PIPELINE        │
+        │                          │      │                             │
+        │  1. Ingestion Manager    │      │  1. Query Receiver          │
+        │  2. Parser (tree-sitter) │      │  2. Vector Retriever         │
+        │  3. Graph Builder        │      │  3. Graph Expander           │
+        │  4. Chunker (LlamaIndex) │      │  4. Context Assembler        │
+        │  5. Embedder             │      │  5. LLM Generator (Ollama)   │
+        │  6. Store Writer         │      │  6. Citation Formatter       │
+        └────────────┬────────────┘      └──────────────┬──────────────┘
+                     │                                    │
+                     ▼                                    ▲
+        ┌─────────────────────────────────────────────────┴───────────┐
+        │                     PERSISTENT STORAGE                       │
+        │  ┌─────────────────┐  ┌───────────────┐  ┌────────────────┐ │
+        │  │  Vector Store    │  │  Graph Store   │  │  Metadata Cache │ │
+        │  │  (ChromaDB)      │  │  (GraphML/Kùzu)│  │  (SQLite)       │ │
+        │  └─────────────────┘  └───────────────┘  └────────────────┘ │
+        └────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Component Breakdown
+
+### 4.1 Ingestion Manager
+**Responsibility:** Discover which files should be processed.
+**Inputs:** Repo path or Git URL, include/exclude config.
+**Outputs:** A filtered list of file paths with detected language tags.
+**Key logic:** Applies `.gitignore`-style filtering, strips binaries/minified files, computes a content hash per file (used later for incremental re-indexing).
+
+### 4.2 Parser
+**Responsibility:** Convert raw source files into structured symbol data.
+**Inputs:** Filtered file list.
+**Outputs:** Per-file symbol table — functions, classes, imports, call sites, each with line ranges.
+**Key logic:** Runs the appropriate tree-sitter grammar per file's language, walks the resulting AST, extracts symbols. Parse failures are caught and logged per-file without halting the batch (satisfies NFR-6).
+
+### 4.3 Graph Builder
+**Responsibility:** Turn per-file symbol tables into a single repo-wide relationship graph.
+**Inputs:** All symbol tables from the Parser.
+**Outputs:** A directed graph — nodes are files/classes/functions, edges are `imports` / `calls` / `inherits_from` / `defined_in`.
+**Key logic:** Resolves call sites to definitions where statically possible (e.g., matching a called function name to its defining module via import resolution). Unresolved calls (e.g., dynamic dispatch) are recorded as unresolved edges rather than dropped, so gaps are visible.
+
+### 4.4 Chunker
+**Responsibility:** Split code into embedding-ready units.
+**Inputs:** Source files + symbol boundaries from the Parser.
+**Outputs:** Code chunks aligned to function/class boundaries, each tagged with its file path, line range, and a reference to its graph node ID.
+**Key logic:** Uses LlamaIndex's `CodeSplitter` so chunk boundaries respect syntax rather than cutting mid-function.
+
+### 4.5 Embedder
+**Responsibility:** Convert code chunks into vector representations.
+**Inputs:** Chunks from the Chunker.
+**Outputs:** Embedding vectors, one per chunk.
+**Key logic:** Runs a local embedding model (`bge-small-en-v1.5` or a code-specialized alternative) via `sentence-transformers`. No network call — fully offline.
+
+### 4.6 Store Writer
+**Responsibility:** Persist everything the Index Pipeline produced.
+**Inputs:** Graph (from 4.3), chunks + embeddings (from 4.4/4.5), file hashes (from 4.1).
+**Outputs:** Updated on-disk stores.
+**Key logic:** Writes embeddings + chunk metadata to ChromaDB, writes/updates the graph file, updates the SQLite hash table used to detect future changes.
+
+---
+
+### 4.7 Query Receiver
+**Responsibility:** Accept and normalize a user's natural-language question (CLI arg or web form input).
+
+### 4.8 Vector Retriever
+**Responsibility:** Find the top-K chunks most semantically similar to the query.
+**Inputs:** Query text, embedding model, ChromaDB collection.
+**Outputs:** Ranked list of candidate chunks with similarity scores.
+
+### 4.9 Graph Expander
+**Responsibility:** Enrich the vector-retrieved chunks with structurally connected code.
+**Inputs:** Candidate chunks from 4.8, the persisted graph.
+**Outputs:** An expanded chunk set including direct callers, callees, and importers of the initial matches.
+**Key logic:** This is the component that differentiates the system from plain RAG — it ensures the LLM sees not just "similar-looking code" but "code that is actually structurally related" to the question's subject.
+
+### 4.10 Context Assembler
+**Responsibility:** Build the final prompt context.
+**Inputs:** Expanded chunk set.
+**Outputs:** A formatted context block (code + file/line references) within the LLM's context window budget.
+**Key logic:** Deduplicates overlapping chunks, truncates/prioritizes if the combined context exceeds the model's window, preserves file/line metadata alongside each snippet for citation.
+
+### 4.11 LLM Generator
+**Responsibility:** Produce a natural-language answer grounded in the assembled context.
+**Inputs:** User question + assembled context.
+**Outputs:** Answer text.
+**Key logic:** Calls a local Ollama model. Prompt instructs the model to answer only from provided context and to explicitly say when context is insufficient (satisfies FR-5.6 — no fabricated answers).
+
+### 4.12 Citation Formatter
+**Responsibility:** Present the answer alongside verifiable evidence.
+**Inputs:** LLM answer + the source chunks used.
+**Outputs:** Final formatted response — answer text plus a list of `file_path:start_line-end_line` references.
+
+---
+
+## 5. Data Flow: Index Mode (Sequence)
+
+```
+User runs `index <repo>`
+   → Ingestion Manager scans repo, filters files, hashes content
+   → For each file:
+        Parser extracts symbols
+        Graph Builder adds nodes/edges
+        Chunker splits into code-aware chunks
+        Embedder generates vectors
+   → Store Writer persists graph + vectors + hashes
+   → CLI reports: files indexed, symbols extracted, time taken
+```
+
+## 6. Data Flow: Query Mode (Sequence)
+
+```
+User runs `query "How does the payment flow work?"`
+   → Query Receiver normalizes input
+   → Vector Retriever fetches top-K similar chunks
+   → Graph Expander pulls in direct callers/callees/imports of those chunks
+   → Context Assembler builds a bounded, deduplicated context block
+   → LLM Generator (Ollama) produces an answer grounded in that context
+   → Citation Formatter attaches file/line evidence
+   → CLI/Web UI displays answer + citations
+```
+
+## 7. Data Flow: Incremental Re-index Mode
+
+```
+Git hook (post-merge) or manual trigger fires
+   → Ingestion Manager re-hashes all tracked files
+   → Diff against SQLite hash table → changed/added/deleted file list
+   → For changed/added files only: re-run Parser → Chunker → Embedder
+   → Graph Builder updates only the edges touching changed files
+   → Store Writer updates ChromaDB (upsert) and graph store
+   → Deleted files: corresponding nodes/edges and vector entries are removed
+```
+
+---
+
+## 8. Storage Design
+
+| Store | Contents | Why This Shape |
+|---|---|---|
+| ChromaDB (vector store) | Chunk text, embedding vector, metadata (file path, line range, graph node ID) | Enables fast top-K semantic search; metadata travels with the vector so no join is needed at query time |
+| Graph store (GraphML or Kùzu) | Nodes (file/class/function/method), edges (imports/calls/inherits/defined_in) | Enables structural traversal queries ("what calls X") that vector search alone cannot answer |
+| SQLite hash cache | File path → content hash → last-indexed timestamp | Lightweight, queryable, supports fast diffing for incremental re-index without needing git internals for non-git directories |
+
+All three stores live in a single `.agent_index/` directory inside (or alongside) the target repo, keeping the index portable and easy to `.gitignore`.
+
+---
+
+## 9. Key Design Decisions & Rationale
+
+| Decision | Rationale |
+|---|---|
+| Graph-augmented retrieval instead of pure vector RAG | Pure vector search finds *semantically similar* code, not *structurally relevant* code. A question like "what breaks if I change X" is a graph traversal problem, not a similarity problem. Combining both gives more accurate, less hallucination-prone answers. |
+| Embedded stores (ChromaDB, SQLite) instead of server-based DBs | Keeps the system zero-ops for a single developer or small team — no database server to install, configure, or keep running. Aligns with the "no paid resources / minimal infra" constraint. |
+| Chunking by syntax boundary, not fixed line count | Preserves the meaning of each chunk — a function split in half loses context and produces worse embeddings and worse LLM answers. |
+| Explicit "insufficient context" response path | Prevents the agent from confidently fabricating explanations of code that doesn't exist — critical for developer trust in onboarding tooling. |
+| Per-file fault isolation in parsing | One malformed or unusually structured file should not block indexing of an entire large repo. |
+| Incremental re-indexing via content hashing | Full re-index on every change doesn't scale past small repos; hash-based diffing keeps re-index fast enough to run on every merge. |
+
+---
+
+## 10. Failure Modes & Handling
+
+| Failure | Handling |
+|---|---|
+| tree-sitter fails to parse a file (syntax error, unsupported language) | Log and skip that file; continue indexing the rest of the repo |
+| Embedding model produces low-confidence matches for a query | Retrieval returns results below a similarity threshold → system reports "insufficient context" rather than passing weak matches to the LLM |
+| Ollama model unavailable or not pulled | CLI fails fast with a clear setup instruction, rather than a silent hang |
+| Graph resolution ambiguity (e.g., dynamic dispatch, duck typing) | Edge marked as "unresolved" in the graph rather than guessed — visible in graph queries so users know where structural coverage is incomplete |
+| Repo too large for available RAM during full index | Ingestion Manager processes files in batches rather than loading the entire repo into memory at once |
+
+---
+
+## 11. Extensibility Points
+
+- **New languages:** Add a tree-sitter grammar + a small language-specific symbol-extraction adapter; Graph Builder, Chunker, and everything downstream are language-agnostic.
+- **New interfaces:** Query Pipeline is decoupled from CLI/Web — a Slack bot or IDE plugin could call the same pipeline directly.
+- **Swappable models:** Embedding model and LLM are both configuration-driven (FR-8), so upgrading to a stronger local model requires no architectural change.
+- **Swappable graph store:** NetworkX/GraphML is sufficient for MVP; the Graph Builder's output interface is designed so Kùzu (or another embedded graph DB) can be substituted for larger repos without touching upstream components.
+
+---
+
+## 12. Mapping to FRD
+
+| Architecture Component | FRD Requirement(s) |
+|---|---|
+| Ingestion Manager | FR-1 |
+| Parser | FR-2 |
+| Graph Builder | FR-3 |
+| Chunker, Embedder, Store Writer | FR-4 |
+| Vector Retriever, Graph Expander, Context Assembler, LLM Generator, Citation Formatter | FR-5 |
+| Incremental re-index flow | FR-6 |
+| CLI / Web UI | FR-7 |
+| Config-driven model/chunk/language settings | FR-8 |

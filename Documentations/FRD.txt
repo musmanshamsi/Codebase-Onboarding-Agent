@@ -1,0 +1,219 @@
+# Functional Requirements Document (FRD)
+## Codebase Onboarding Agent
+
+| Field | Value |
+|---|---|
+| Document Version | 1.0 |
+| Status | Draft |
+| Author | — |
+| Last Updated | 2026-08-13 |
+
+---
+
+## 1. Purpose
+
+The Codebase Onboarding Agent is an AI-powered tool that ingests a software repository, builds a structural knowledge graph of its modules and dependencies, and answers natural-language questions about how the codebase works — with citations to actual files and line numbers. It reduces the time new developers or contributors need to become productive in an unfamiliar codebase.
+
+## 2. Scope
+
+### 2.1 In Scope
+- Parsing and indexing source code from a local or cloned Git repository
+- Building a dependency/call graph across files, functions, and classes
+- Semantic + structural retrieval of relevant code in response to natural-language queries
+- Generating LLM-based answers grounded in retrieved code, with file/line citations
+- Re-indexing on repository changes (incremental updates)
+- CLI and/or lightweight web interface for querying
+- Support for at least one language at MVP (Python), extensible to others
+
+### 2.2 Out of Scope
+- Code generation or auto-refactoring (read/explain only, not write)
+- Real-time pair-programming/autocomplete (covered by separate tooling, e.g. Continue.dev)
+- Security vulnerability scanning
+- Multi-repo / cross-organization knowledge sharing (single repo per instance at MVP)
+- Non-code artifacts (e.g., Confluence docs, Jira tickets) at MVP
+
+## 3. Stakeholders / User Personas
+
+| Persona | Need |
+|---|---|
+| New developer/contributor | Understand unfamiliar code quickly without bothering senior devs |
+| Senior developer/maintainer | Reduce time spent answering repetitive onboarding questions |
+| Open-source maintainer | Lower the barrier for external contributors |
+| Technical lead | Get architecture-level summaries of legacy or inherited codebases |
+
+## 4. Definitions & Glossary
+
+| Term | Definition |
+|---|---|
+| AST | Abstract Syntax Tree — structural representation of parsed source code |
+| Node (graph) | A code entity: file, class, function, or method |
+| Edge (graph) | A relationship between nodes: calls, imports, inherits, defined_in |
+| Chunk | A semantically meaningful slice of code (e.g., one function) used for embedding |
+| RAG | Retrieval-Augmented Generation — retrieving relevant context before LLM generation |
+| Index | The combined vector store + graph store representing the repo's current state |
+
+---
+
+## 5. Functional Requirements
+
+### FR-1: Repository Ingestion
+- FR-1.1: System shall accept a local file path or a Git URL as input.
+- FR-1.2: System shall clone the repository if a remote URL is provided.
+- FR-1.3: System shall allow the user to specify include/exclude patterns (e.g., exclude `node_modules`, `.venv`, `dist`).
+- FR-1.4: System shall detect the primary language(s) present in the repo.
+- FR-1.5: System shall reject or skip binary files, minified files, and files exceeding a configurable size limit.
+
+### FR-2: Code Parsing
+- FR-2.1: System shall parse each supported source file into an AST using tree-sitter.
+- FR-2.2: System shall extract, per file: function/method definitions, class definitions, import statements, and top-level variables.
+- FR-2.3: System shall record start/end line numbers for every extracted symbol.
+- FR-2.4: System shall handle and log parse failures per file without halting the overall ingestion process.
+
+### FR-3: Knowledge Graph Construction
+- FR-3.1: System shall build a directed graph where nodes represent files, classes, functions, and methods.
+- FR-3.2: System shall create edges for: `imports`, `calls`, `inherits_from`, `defined_in`.
+- FR-3.3: System shall resolve function call sites to their definitions where statically determinable.
+- FR-3.4: System shall persist the graph to disk in a format that can be reloaded without re-parsing (e.g., GraphML or embedded graph DB).
+- FR-3.5: System shall support querying the graph directly (e.g., "what calls function X", "what does file Y import").
+
+### FR-4: Semantic Indexing
+- FR-4.1: System shall chunk code along function/class boundaries (not arbitrary line splits).
+- FR-4.2: System shall generate vector embeddings for each chunk using a local embedding model (no external API required).
+- FR-4.3: System shall store embeddings, source text, and graph metadata (callers/callees/file path/line range) together per chunk.
+- FR-4.4: System shall persist embeddings in a local vector store that survives process restarts.
+
+### FR-5: Query & Retrieval
+- FR-5.1: System shall accept natural-language questions from the user via CLI or web UI.
+- FR-5.2: System shall retrieve the top-K semantically relevant code chunks for a given query.
+- FR-5.3: System shall expand retrieved results using the knowledge graph (direct callers/callees/imports of matched chunks).
+- FR-5.4: System shall pass retrieved context to a local LLM to synthesize a natural-language answer.
+- FR-5.5: System shall return, alongside the answer, the specific file paths and line ranges used as evidence.
+- FR-5.6: System shall indicate when it cannot find sufficiently relevant context, rather than fabricating an answer.
+
+### FR-6: Incremental Re-indexing
+- FR-6.1: System shall detect changed, added, or deleted files since the last index (via git diff or file hashes).
+- FR-6.2: System shall re-parse and re-embed only changed files, not the full repository, on incremental updates.
+- FR-6.3: System shall update graph edges affected by changed files (e.g., new/removed function calls).
+- FR-6.4: System shall optionally support a git hook (post-merge/post-checkout) to trigger re-indexing automatically.
+
+### FR-7: User Interface
+- FR-7.1: System shall provide a CLI command to index a repo (`index`) and query it (`query "<question>"`).
+- FR-7.2: System shall optionally provide a lightweight web UI for asking questions and viewing cited code.
+- FR-7.3: System shall display retrieved code snippets alongside the generated answer, not just the answer text.
+
+### FR-8: Configuration
+- FR-8.1: System shall allow the user to select which local LLM model to use (via Ollama).
+- FR-8.2: System shall allow the user to select which embedding model to use.
+- FR-8.3: System shall allow configuration of chunk size, overlap, and top-K retrieval count.
+- FR-8.4: System shall allow configuration of included languages and file extensions.
+
+---
+
+## 6. Non-Functional Requirements
+
+| ID | Requirement |
+|---|---|
+| NFR-1 | System shall run entirely on local/self-hosted infrastructure — no paid API keys required at any stage. |
+| NFR-2 | Initial indexing of a repository up to 50,000 lines of code shall complete in under 10 minutes on a standard developer laptop (16GB RAM). |
+| NFR-3 | Incremental re-indexing of a single changed file shall complete in under 15 seconds. |
+| NFR-4 | Query response time shall be under 20 seconds on a standard developer laptop running a 7–8B parameter local model. |
+| NFR-5 | System shall function fully offline once models and dependencies are downloaded. |
+| NFR-6 | System shall log all parse errors and failed retrievals for debugging without crashing the main process. |
+| NFR-7 | System shall be extensible to additional languages by adding new tree-sitter grammars without core architecture changes. |
+| NFR-8 | Vector store and graph data shall be stored locally in a human-inspectable format (e.g., SQLite/GraphML/Chroma persistence directory). |
+
+---
+
+## 7. System Architecture (Functional View)
+
+```
+Repository (local/cloned)
+        │
+        ▼
+ [Ingestion Layer]  — file discovery, filtering, language detection
+        │
+        ▼
+ [Parsing Layer]    — tree-sitter AST extraction per file
+        │
+        ▼
+ [Graph Layer]      — builds/updates dependency & call graph
+        │
+        ▼
+ [Indexing Layer]   — code-aware chunking + local embeddings
+        │
+        ▼
+ [Storage Layer]    — vector store (ChromaDB) + graph store (GraphML/Kùzu)
+        │
+        ▼
+ [Retrieval Layer]  — vector search + graph expansion
+        │
+        ▼
+ [Generation Layer] — local LLM (Ollama) synthesizes cited answer
+        │
+        ▼
+ [Interface Layer]  — CLI / Web UI
+```
+
+## 8. Data Requirements
+
+| Data Object | Description | Storage |
+|---|---|---|
+| Source files | Raw code from the repo | Read from filesystem, not duplicated |
+| Symbol table | Extracted functions/classes/imports per file | In-memory during indexing, cached to disk |
+| Knowledge graph | Nodes + edges representing code structure | GraphML file or embedded graph DB |
+| Code chunks | Function/class-level text segments | Paired with embeddings |
+| Embeddings | Vector representations of chunks | ChromaDB persistent collection |
+| Query logs (optional) | Questions asked + answers given, for improving retrieval | Local log file |
+
+## 9. Use Cases
+
+### UC-1: New Contributor Understands a Feature
+**Actor:** New developer
+**Flow:** Developer runs `query "How does the checkout flow work?"` → system retrieves relevant chunks (checkout route, payment processor, order model) → graph expansion pulls in the functions those chunks call → LLM produces an explanation citing `routes/checkout.py:12-40`, `services/payment.py:5-30`.
+**Success Criteria:** Answer correctly reflects the actual call chain and cites real, existing line ranges.
+
+### UC-2: Maintainer Investigates Impact of a Change
+**Actor:** Maintainer
+**Flow:** Maintainer asks `query "What would break if I change the signature of authenticate_user()?"` → graph layer identifies all callers of `authenticate_user` → LLM lists affected files/functions.
+**Success Criteria:** All actual callers in the repo are identified; no hallucinated callers.
+
+### UC-3: Repo Updated, Index Refreshed
+**Actor:** CI system / git hook
+**Flow:** Developer merges a PR → post-merge hook triggers incremental re-index → only changed files are re-parsed and re-embedded → graph edges updated.
+**Success Criteria:** Next query reflects the new code state without a full re-index.
+
+### UC-4: Unanswerable Question
+**Actor:** Any user
+**Flow:** User asks about functionality that doesn't exist in the repo → retrieval returns low-relevance results → system responds that it cannot find relevant code, rather than guessing.
+**Success Criteria:** No fabricated file paths or invented functions.
+
+---
+
+## 10. Acceptance Criteria (MVP)
+
+- [ ] Can index a real-world Python repository (10,000+ LOC) end-to-end without manual intervention
+- [ ] Can answer at least 10 representative "how does X work" questions with correct file/line citations, verified manually
+- [ ] Citations point to lines that actually exist and are relevant to the answer (0% hallucinated file paths in test set)
+- [ ] Incremental re-index correctly reflects a changed function without requiring full re-index
+- [ ] Runs with zero paid API calls — confirmed via network monitoring during a full run
+- [ ] Graph query ("what calls X") returns results matching manual code inspection
+
+## 11. Assumptions
+
+- Target repositories are primarily statically analyzable languages (dynamic language edge cases like heavy use of `eval`/reflection may reduce graph accuracy).
+- User has sufficient local compute (≥16GB RAM) to run a 7–8B parameter model at acceptable latency.
+- Repository is reasonably well-structured (extreme monolith files or generated code may degrade chunking quality).
+
+## 12. Constraints
+
+- No paid APIs, keys, or cloud services may be required for core functionality.
+- All models (LLM + embeddings) must be runnable locally via free/open-source tooling (Ollama, HuggingFace models).
+- Must operate within the compute limits of a typical developer laptop for MVP; larger repos may require documented scaling guidance rather than being fully in-scope.
+
+## 13. Future Enhancements (Post-MVP, Not in Current Scope)
+
+- Multi-language support beyond Python (JS/TS, Go, Rust, Java via additional tree-sitter grammars)
+- Multi-repo knowledge federation
+- Slack/Discord bot interface
+- Ingestion of non-code docs (READMEs, ADRs, wikis) into the same retrieval layer
+- Visual graph explorer UI
