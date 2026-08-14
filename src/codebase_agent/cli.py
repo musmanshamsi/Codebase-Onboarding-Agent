@@ -339,5 +339,22 @@ def hook_status(repo: str):
     click.echo(f"Hook File Path: {installer.hook_file}")
 
 
+@main.command()
+@click.option("--repo", "-r", default=".", help="Path to target repository.")
+@click.option("--port", "-p", default=8000, help="Port to run Web UI server.")
+def ui(repo: str, port: int):
+    """Launch local interactive Web UI dashboard (FR-7.2)."""
+    import uvicorn
+    from codebase_agent.ui.server import create_app
+
+    repo_path = Path(repo).resolve()
+    click.echo(f"=== Codebase Onboarding Agent Web UI ===")
+    click.echo(f"Repository: {repo_path}")
+    click.echo(f"Dashboard URL: http://localhost:{port}")
+
+    app = create_app(repo_root=repo_path)
+    uvicorn.run(app, host="127.0.0.1", port=port)
+
+
 if __name__ == "__main__":
     main()

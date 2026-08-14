@@ -1,23 +1,10 @@
-"""Git Hook Installer component (FR-6.3)."""
+"""Git Hook Installer component with dynamic python executable resolution (FR-6.3)."""
 
 import os
 import stat
+import sys
 from pathlib import Path
-from typing import Tuple
-
-
-HOOK_SCRIPT_CONTENT = """#!/bin/sh
-# Codebase Onboarding Agent - Automatic Incremental Re-Indexing Post-Commit Hook
-echo "=== [Codebase Agent] Triggering Automatic Post-Commit Incremental Re-Index ==="
-
-if [ -f "./.venv/Scripts/python.exe" ]; then
-    PYTHONPATH="src" ./.venv/Scripts/python.exe -m codebase_agent.cli index --repo .
-elif [ -f "./.venv/bin/python" ]; then
-    PYTHONPATH="src" ./.venv/bin/python -m codebase_agent.cli index --repo .
-else
-    PYTHONPATH="src" python -m codebase_agent.cli index --repo .
-fi
-"""
+from typing import Tuple, Optional
 
 
 class GitHookInstaller:
@@ -33,6 +20,26 @@ class GitHookInstaller:
         """Checks if target directory is a valid Git repository."""
         return self.git_dir.exists() and self.git_dir.is_dir()
 
+    def generate_hook_script(self) -> str:
+        """Generates machine-portable post-commit script using system/venv python path."""
+        python_bin = sys.executable.replace("\\", "/")
+        repo_abs = str(self.repo_root.resolve()).replace("\\", "/")
+
+        return f"""#!/bin/sh
+# Codebase Onboarding Agent - Automatic Incremental Re-Indexing Post-Commit Hook
+echo "=== [Codebase Agent] Triggering Automatic Post-Commit Incremental Re-Index ==="
+
+if [ -f "./.venv/Scripts/python.exe" ]; then
+    PYTHONPATH="src" ./.venv/Scripts/python.exe -m codebase_agent.cli index --repo .
+elif [ -f "./.venv/bin/python" ]; then
+    PYTHONPATH="src" ./.venv/bin/python -m codebase_agent.cli index --repo .
+elif [ -f "{python_bin}" ]; then
+    PYTHONPATH="src" "{python_bin}" -m codebase_agent.cli index --repo "{repo_abs}"
+else
+    PYTHONPATH="src" python -m codebase_agent.cli index --repo .
+fi
+"""
+
     def install_hook(self) -> Tuple[bool, str]:
         """Installs post-commit hook script in .git/hooks/post-commit."""
         if not self.is_git_repository():
@@ -40,15 +47,15 @@ class GitHookInstaller:
 
         try:
             self.hooks_dir.mkdir(parents=True, exist_ok=True)
+            script_content = self.generate_hook_script()
             with open(self.hook_file, "w", encoding="utf-8", newline="\n") as f:
-                f.write(HOOK_SCRIPT_CONTENT)
+                f.write(script_content)
 
-            # Make hook executable on POSIX systems
             if os.name == "posix":
                 current_mode = os.stat(self.hook_file).st_mode
                 os.chmod(self.hook_file, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-            return True, f"Successfully installed post-commit hook at: {self.hook_file}"
+            return True, f"Successfully installed portable post-commit hook at: {self.hook_file}"
         except Exception as ex:
             return False, f"Failed to install Git hook: {str(ex)}"
 

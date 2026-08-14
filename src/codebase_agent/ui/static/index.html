@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Codebase Onboarding Agent - Repository Intelligence</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-layout">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="logo-icon">⚡</div>
+                <div class="brand-text">
+                    <h1>Codebase Agent</h1>
+                    <span class="badge">Local AI</span>
+                </div>
+            </div>
+
+            <nav class="nav-menu">
+                <button class="nav-item active" id="nav-search" onclick="switchTab('search')">
+                    <span class="icon">💬</span> Query & Search
+                </button>
+                <button class="nav-item" id="nav-graph" onclick="switchTab('graph')">
+                    <span class="icon">🕸️</span> Structural Graph
+                </button>
+                <button class="nav-item" id="nav-status" onclick="switchTab('status')">
+                    <span class="icon">📊</span> Repository Index
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="status-indicator">
+                    <span class="dot online" id="ollama-dot"></span>
+                    <span id="ollama-status-text">Ollama: Checking...</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Header Bar -->
+            <header class="top-bar">
+                <div class="repo-info">
+                    <span class="label">Repository:</span>
+                    <span class="value" id="header-repo-path">Loading...</span>
+                </div>
+                <div class="top-actions">
+                    <button class="btn btn-secondary" onclick="triggerReindex()">
+                        <span class="icon">🔄</span> Re-Index
+                    </button>
+                </div>
+            </header>
+
+            <!-- Tab 1: Search & Question Answering -->
+            <section class="tab-content active" id="tab-search">
+                <div class="search-hero">
+                    <h2>Ask Natural-Language Questions</h2>
+                    <p>Engineered with Hybrid Semantic Vector Search + 1-Hop Knowledge Graph Expansion.</p>
+                    
+                    <form class="search-form" onsubmit="handleQuerySubmit(event)">
+                        <div class="input-wrapper">
+                            <input type="text" id="query-input" placeholder="How does process_payment charge cards?..." required autocomplete="off">
+                            <button type="submit" class="btn btn-primary" id="btn-submit-query">
+                                <span>Ask Agent</span>
+                            </button>
+                        </div>
+
+                        <!-- Settings Drawer -->
+                        <div class="controls-bar">
+                            <div class="control-group">
+                                <label for="model-select">Local LLM:</label>
+                                <select id="model-select">
+                                    <option value="qwen2.5-coder:7b">qwen2.5-coder:7b</option>
+                                    <option value="qwen2.5-coder:1.5b">qwen2.5-coder:1.5b</option>
+                                </select>
+                            </div>
+                            <div class="control-group">
+                                <label for="topk-input">Top-K Chunks: <span id="val-topk">3</span></label>
+                                <input type="range" id="topk-input" min="1" max="8" value="3" oninput="document.getElementById('val-topk').innerText=this.value">
+                            </div>
+                            <div class="control-group">
+                                <label for="thresh-input">Threshold: <span id="val-thresh">0.30</span></label>
+                                <input type="range" id="thresh-input" min="0.0" max="0.9" step="0.05" value="0.30" oninput="document.getElementById('val-thresh').innerText=parseFloat(this.value).toFixed(2)">
+                            </div>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Answer Output Container -->
+                <div class="output-container hidden" id="output-container">
+                    <div class="output-card">
+                        <div class="card-header">
+                            <h3>Answer Synthesis</h3>
+                            <span class="model-badge" id="output-model-badge">qwen2.5-coder:7b</span>
+                        </div>
+                        <div class="answer-body" id="answer-text">
+                            <!-- Answer text goes here -->
+                        </div>
+                    </div>
+
+                    <!-- Citations Section -->
+                    <div class="citations-section">
+                        <h3>Verifiable Evidence Citations</h3>
+                        <div class="citations-grid" id="citations-grid">
+                            <!-- Citation cards rendered here -->
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Tab 2: Structural Knowledge Graph -->
+            <section class="tab-content" id="tab-graph">
+                <div class="section-header">
+                    <h2>Knowledge Graph Explorer</h2>
+                    <p>Visualizing AST Call-Sites, Function Callers/Callees, and Module Import Dependencies.</p>
+                </div>
+                <div class="graph-viewport glass-panel" id="graph-viewport">
+                    <svg id="graph-svg" width="100%" height="600"></svg>
+                    <div class="graph-legend">
+                        <span class="legend-item"><span class="color-dot func"></span> Function/Method</span>
+                        <span class="legend-item"><span class="color-dot file"></span> Source File</span>
+                        <span class="legend-item"><span class="color-dot class"></span> Class</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Tab 3: Repository Status -->
+            <section class="tab-content" id="tab-status">
+                <div class="section-header">
+                    <h2>Repository Index Status</h2>
+                    <p>Metadata cache, SQLite records, GraphML nodes, and ChromaDB vector store details.</p>
+                </div>
+
+                <div class="stats-grid">
+                    <div class="stat-card glass-panel">
+                        <span class="stat-value" id="stat-files">0</span>
+                        <span class="stat-label">Source Files</span>
+                    </div>
+                    <div class="stat-card glass-panel">
+                        <span class="stat-value" id="stat-symbols">0</span>
+                        <span class="stat-label">Parsed Symbols</span>
+                    </div>
+                    <div class="stat-card glass-panel">
+                        <span class="stat-value" id="stat-nodes">0</span>
+                        <span class="stat-label">Graph Nodes</span>
+                    </div>
+                    <div class="stat-card glass-panel">
+                        <span class="stat-value" id="stat-edges">0</span>
+                        <span class="stat-label">Graph Edges</span>
+                    </div>
+                </div>
+
+                <div class="details-card glass-panel margin-top">
+                    <h3>Cache & Store Paths</h3>
+                    <div class="path-list">
+                        <div class="path-item">
+                            <span class="label">Index Directory:</span>
+                            <code id="path-index">...</code>
+                        </div>
+                        <div class="path-item">
+                            <span class="label">Last Index Run:</span>
+                            <span id="stat-last-run">Never</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
