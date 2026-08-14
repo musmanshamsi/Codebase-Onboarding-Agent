@@ -11,9 +11,11 @@ from codebase_agent.generation.citation_formatter import CitationFormatter
 from codebase_agent.generation.receiver import QueryReceiver
 from codebase_agent.graph.builder import GraphBuilder
 from codebase_agent.graph.store import GraphStore
+from codebase_agent.hooks.installer import GitHookInstaller
 from codebase_agent.indexing.chunker import Chunker
 from codebase_agent.indexing.embedder import Embedder
 from codebase_agent.ingestion.manager import IngestionManager
+from codebase_agent.ingestion.reindexer import Reindexer
 from codebase_agent.parser.ast_parser import Parser
 from codebase_agent.retrieval.context_assembler import ContextAssembler
 from codebase_agent.retrieval.graph_expander import GraphExpander
@@ -35,7 +37,7 @@ def main():
 def index(repo: str, dry_run: bool, full: bool):
     """Index a code repository (Phases 1-4: Ingestion, Parsing, Graph, Vector Embeddings)."""
     start_time = time.time()
-    click.echo(f"=== Codebase Indexing (Phases 1-4) ===")
+    click.echo(f"=== Codebase Indexing ===")
     click.echo(f"Target repository: {repo}")
     click.echo(f"Mode: {'Dry-Run' if dry_run else 'Full Index' if full else 'Incremental'}")
 
@@ -56,8 +58,6 @@ def index(repo: str, dry_run: bool, full: bool):
         chroma_dir = index_dir / "chroma"
 
         cache = MetadataCache(db_path=db_path)
-        parser = Parser()
-        chunker = Chunker()
 
         discovered = manager.discover_files()
         click.echo(f"Discovered source files: {len(discovered)}")
@@ -79,86 +79,20 @@ def index(repo: str, dry_run: bool, full: bool):
         click.echo(f"Files to process (new/changed): {len(to_process)}")
         click.echo(f"Files to remove: {len(to_delete)}")
 
-        all_parse_results = {}
-        all_chunks = []
-        processed_count = 0
-        failed_count = 0
-
-        for abs_p, rel_p in discovered:
-            res = parser.parse_file(file_path=rel_p, repo_root=repo_root)
-            all_parse_results[rel_p] = res
-            if res.parse_status == "success":
-                processed_count += 1
-            else:
-                failed_count += 1
-
-            is_new_or_changed = any(item["rel_path"] == rel_p for item in to_process)
-            if is_new_or_changed and res.parse_status == "success":
-                try:
-                    with open(abs_p, "r", encoding="utf-8", errors="replace") as f:
-                        src_text = f.read()
-                    c_hash = manager.compute_content_hash(abs_p)
-                    f_chunks = chunker.chunk_file(
-                        file_path=rel_p,
-                        source_code=src_text,
-                        parse_result=res,
-                        content_hash=c_hash
-                    )
-                    all_chunks.extend(f_chunks)
-                except Exception as ex:
-                    click.echo(f"Error chunking file {rel_p}: {ex}", err=True)
-
-        total_symbols = sum(len(r.symbols) for r in all_parse_results.values())
-        click.echo(f"Parsed files: {len(all_parse_results)} ({total_symbols} symbols extracted)")
-        click.echo(f"Generated chunks to embed: {len(all_chunks)}")
-
-        graph_builder = GraphBuilder()
-        G = graph_builder.build_graph(all_parse_results)
-        click.echo(f"Knowledge Graph Built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-
-        if all_chunks and not dry_run:
-            click.echo("Generating local embeddings via SentenceTransformers...")
-            embedder = Embedder()
-            embedder.embed_chunks(all_chunks)
-
-            store_writer = StoreWriter(chroma_dir=chroma_dir)
-            store_writer.upsert_chunks(all_chunks)
-
-            for del_path in to_delete:
-                store_writer.delete_file_chunks(del_path)
-
         if not dry_run:
-            run_id = cache.start_index_run(run_type="full" if full else "incremental")
-
-            for item in to_process:
-                p_res = all_parse_results.get(item["rel_path"])
-                sym_cnt = len(p_res.symbols) if p_res else 0
-                p_stat = p_res.parse_status if p_res else "failed"
-                p_err = p_res.error_message if p_res else "Parse omitted"
-
-                cache.upsert_file_state(
-                    file_path=item["rel_path"],
-                    content_hash=item["content_hash"],
-                    language=item["language"],
-                    symbol_count=sym_cnt,
-                    parse_status=p_stat,
-                    parse_error=p_err
-                )
-
-            for del_path in to_delete:
-                cache.delete_file_state(del_path)
-
-            cache.finish_index_run(
-                run_id=run_id,
-                files_processed=processed_count,
-                files_failed=failed_count,
-                status="completed"
+            reindexer = Reindexer(repo_root=repo_root, config=config)
+            summary = reindexer.execute_incremental(
+                to_process=to_process,
+                to_delete=to_delete,
+                discovered_files=discovered
             )
 
-            GraphStore.save_graph(G, graph_path)
-
             click.echo("\n--- Indexing Output Summary ---")
-            click.echo(f"Run ID: {run_id}")
+            click.echo(f"Run ID: {summary['run_id']}")
+            click.echo(f"Processed Files: {summary['processed_files']}")
+            click.echo(f"Evicted Deleted Files: {summary['deleted_files']}")
+            click.echo(f"New Chunks Stored: {summary['new_chunks']}")
+            click.echo(f"Graph Nodes: {summary['graph_nodes']}, Edges: {summary['graph_edges']}")
             click.echo(f"SQLite Cache: {db_path}")
             click.echo(f"GraphML Store: {graph_path}")
             click.echo(f"ChromaDB Store: {chroma_dir}")
@@ -361,6 +295,48 @@ def query_command(question: str, repo: str, model: str, top_k: int, threshold: f
 
     output_text = CitationFormatter.render_output(response)
     click.echo(output_text)
+
+
+@main.group()
+def hook():
+    """Git Hooks Subcommands for Automatic Incremental Indexing (FR-6.3)."""
+    pass
+
+
+@hook.command("install")
+@click.option("--repo", "-r", default=".", help="Path to target Git repository.")
+def hook_install(repo: str):
+    """Install .git/hooks/post-commit script to trigger automatic incremental re-indexing on commits (FR-6.3)."""
+    installer = GitHookInstaller(repo_root=Path(repo))
+    success, msg = installer.install_hook()
+    if success:
+        click.echo(f"Success: {msg}")
+    else:
+        click.echo(f"Error: {msg}", err=True)
+        sys.exit(1)
+
+
+@hook.command("uninstall")
+@click.option("--repo", "-r", default=".", help="Path to target Git repository.")
+def hook_uninstall(repo: str):
+    """Uninstall .git/hooks/post-commit script (FR-6.3)."""
+    installer = GitHookInstaller(repo_root=Path(repo))
+    success, msg = installer.uninstall_hook()
+    if success:
+        click.echo(f"Success: {msg}")
+    else:
+        click.echo(f"Error: {msg}", err=True)
+        sys.exit(1)
+
+
+@hook.command("status")
+@click.option("--repo", "-r", default=".", help="Path to target Git repository.")
+def hook_status(repo: str):
+    """Check post-commit hook status."""
+    installer = GitHookInstaller(repo_root=Path(repo))
+    installed = installer.check_status()
+    click.echo(f"Git Post-Commit Hook Installed: {'YES' if installed else 'NO'}")
+    click.echo(f"Hook File Path: {installer.hook_file}")
 
 
 if __name__ == "__main__":
