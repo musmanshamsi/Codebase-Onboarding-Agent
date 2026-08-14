@@ -192,6 +192,16 @@ function renderSvgGraph(data) {
         circle.setAttribute("cy", cy);
         circle.setAttribute("r", 16);
         circle.setAttribute("fill", node.type === "function" ? "#818cf8" : node.type === "class" ? "#f472b6" : "#2dd4bf");
+        circle.style.cursor = "pointer";
+
+        const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+        title.textContent = `ID: ${node.id}\nType: ${node.type}\nFile: ${node.file || 'N/A'}`;
+        circle.appendChild(title);
+
+        circle.addEventListener("click", () => {
+            alert(`Symbol Node Detail:\n• ID: ${node.id}\n• Type: ${node.type}\n• File: ${node.file || 'N/A'}`);
+        });
+
         svg.appendChild(circle);
 
         const text = document.createElementNS("http://www.w3.org/2000/svg", "text");

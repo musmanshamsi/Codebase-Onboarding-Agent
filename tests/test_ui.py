@@ -28,6 +28,21 @@ def test_ui_status_endpoint(test_client):
     assert "graph_nodes" in data
 
 
+def test_ui_status_with_indexed_files(test_client):
+    client, repo_dir = test_client
+    from codebase_agent.storage.metadata_cache import MetadataCache
+    db_path = repo_dir / ".agent_index" / "cache.db"
+    cache = MetadataCache(db_path=db_path)
+    cache.upsert_file_state("main.py", "hash123", "python", symbol_count=2)
+
+    res = client.get("/api/status")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["indexed_files_count"] == 1
+    assert data["total_symbols"] == 2
+
+
+
 def test_ui_models_endpoint(test_client):
     client, _ = test_client
     res = client.get("/api/models")

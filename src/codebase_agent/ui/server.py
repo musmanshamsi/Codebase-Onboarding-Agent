@@ -67,7 +67,7 @@ def create_app(repo_root: Optional[Path] = None) -> FastAPI:
             except Exception:
                 pass
 
-        total_symbols = sum(f.get("symbol_count", 0) for f in indexed_files)
+        total_symbols = sum(f.get("symbol_count", 0) for f in indexed_files.values())
 
         return {
             "repo_path": str(resolved_repo),
