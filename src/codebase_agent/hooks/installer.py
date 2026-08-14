@@ -9,7 +9,14 @@ from typing import Tuple
 HOOK_SCRIPT_CONTENT = """#!/bin/sh
 # Codebase Onboarding Agent - Automatic Incremental Re-Indexing Post-Commit Hook
 echo "=== [Codebase Agent] Triggering Automatic Post-Commit Incremental Re-Index ==="
-PYTHONPATH="src" python -m codebase_agent.cli index --repo .
+
+if [ -f "./.venv/Scripts/python.exe" ]; then
+    PYTHONPATH="src" ./.venv/Scripts/python.exe -m codebase_agent.cli index --repo .
+elif [ -f "./.venv/bin/python" ]; then
+    PYTHONPATH="src" ./.venv/bin/python -m codebase_agent.cli index --repo .
+else
+    PYTHONPATH="src" python -m codebase_agent.cli index --repo .
+fi
 """
 
 
