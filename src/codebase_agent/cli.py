@@ -7,6 +7,8 @@ from pathlib import Path
 import click
 
 from codebase_agent.config import IngestionConfig
+from codebase_agent.graph.builder import GraphBuilder
+from codebase_agent.graph.store import GraphStore
 from codebase_agent.ingestion.manager import IngestionManager
 from codebase_agent.parser.ast_parser import Parser
 from codebase_agent.storage.metadata_cache import MetadataCache
@@ -20,12 +22,12 @@ def main():
 
 @main.command()
 @click.option("--repo", "-r", default=".", help="Path to local repository or remote Git URL.")
-@click.option("--dry-run", is_flag=True, help="Perform discovery and hashing without updating database.")
+@click.option("--dry-run", is_flag=True, help="Perform discovery and parsing without updating database or graph.")
 @click.option("--full", is_flag=True, help="Force full re-indexing instead of incremental diff.")
 def index(repo: str, dry_run: bool, full: bool):
-    """Index a code repository (Phase 1 Ingestion & Metadata Cache)."""
+    """Index a code repository (Phases 1-3: Ingestion, Parsing, Graph)."""
     start_time = time.time()
-    click.echo(f"=== Codebase Ingestion (Phase 1) ===")
+    click.echo(f"=== Codebase Indexing (Phases 1-3) ===")
     click.echo(f"Target repository: {repo}")
     click.echo(f"Mode: {'Dry-Run' if dry_run else 'Full Index' if full else 'Incremental'}")
 
@@ -40,8 +42,12 @@ def index(repo: str, dry_run: bool, full: bool):
         repo_root = manager.repo_path
         click.echo(f"Resolved root: {repo_root}")
 
-        db_path = repo_root / config.index_dir_name / "cache.db"
+        index_dir = repo_root / config.index_dir_name
+        db_path = index_dir / "cache.db"
+        graph_path = index_dir / "graph" / "repo_graph.graphml"
+
         cache = MetadataCache(db_path=db_path)
+        parser = Parser()
 
         discovered = manager.discover_files()
         click.echo(f"Discovered source files: {len(discovered)}")
@@ -63,39 +69,44 @@ def index(repo: str, dry_run: bool, full: bool):
         click.echo(f"Files to process (new/changed): {len(to_process)}")
         click.echo(f"Files to remove: {len(to_delete)}")
 
-        click.echo("\n--- Discovered File Details ---")
-        for item in to_process:
-            click.echo(f"  [+] {item['rel_path']} (Lang: {item['language']}, SHA256: {item['content_hash'][:12]}...)")
+        # --- Phase 2: AST Parsing across all discovered files ---
+        all_parse_results = {}
+        processed_count = 0
+        failed_count = 0
 
-        for del_path in to_delete:
-            click.echo(f"  [-] {del_path} (Deleted from repo)")
+        for abs_p, rel_p in discovered:
+            res = parser.parse_file(file_path=rel_p, repo_root=repo_root)
+            all_parse_results[rel_p] = res
+            if res.parse_status == "success":
+                processed_count += 1
+            else:
+                failed_count += 1
+
+        total_symbols = sum(len(r.symbols) for r in all_parse_results.values())
+        click.echo(f"Parsed files: {len(all_parse_results)} ({total_symbols} symbols extracted)")
+
+        # --- Phase 3: Graph Construction ---
+        graph_builder = GraphBuilder()
+        G = graph_builder.build_graph(all_parse_results)
+        click.echo(f"Knowledge Graph Built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
         if not dry_run:
             run_id = cache.start_index_run(run_type="full" if full else "incremental")
-            processed_count = 0
-            failed_count = 0
 
             for item in to_process:
-                try:
-                    cache.upsert_file_state(
-                        file_path=item["rel_path"],
-                        content_hash=item["content_hash"],
-                        language=item["language"],
-                        symbol_count=0,
-                        parse_status="success",
-                        parse_error=None
-                    )
-                    processed_count += 1
-                except Exception as ex:
-                    failed_count += 1
-                    cache.upsert_file_state(
-                        file_path=item["rel_path"],
-                        content_hash=item["content_hash"],
-                        language=item["language"],
-                        symbol_count=0,
-                        parse_status="failed",
-                        parse_error=str(ex)
-                    )
+                p_res = all_parse_results.get(item["rel_path"])
+                sym_cnt = len(p_res.symbols) if p_res else 0
+                p_stat = p_res.parse_status if p_res else "failed"
+                p_err = p_res.error_message if p_res else "Parse omitted"
+
+                cache.upsert_file_state(
+                    file_path=item["rel_path"],
+                    content_hash=item["content_hash"],
+                    language=item["language"],
+                    symbol_count=sym_cnt,
+                    parse_status=p_stat,
+                    parse_error=p_err
+                )
 
             for del_path in to_delete:
                 cache.delete_file_state(del_path)
@@ -107,15 +118,16 @@ def index(repo: str, dry_run: bool, full: bool):
                 status="completed"
             )
 
-            last_run = cache.get_last_run()
-            click.echo("\n--- Metadata Cache Status ---")
-            click.echo(f"Run ID: {last_run['run_id']}")
-            click.echo(f"Status: {last_run['status']}")
-            click.echo(f"Processed: {last_run['files_processed']}, Failed: {last_run['files_failed']}")
-            click.echo(f"Database persisted at: {db_path}")
+            # Persist GraphML
+            GraphStore.save_graph(G, graph_path)
+
+            click.echo("\n--- Indexing Output Summary ---")
+            click.echo(f"Run ID: {run_id}")
+            click.echo(f"SQLite Cache: {db_path}")
+            click.echo(f"GraphML Store: {graph_path}")
 
         elapsed = time.time() - start_time
-        click.echo(f"\nIngestion phase completed in {elapsed:.3f} seconds.")
+        click.echo(f"\nIndexing pipeline completed in {elapsed:.3f} seconds.")
 
     finally:
         manager.cleanup()
@@ -154,6 +166,61 @@ def parse(file: str, json_out: bool):
     for cs in result.call_sites:
         caller = cs.caller_symbol_id or "global"
         click.echo(f"  - Line {cs.line_number}: call {cs.function_name}() inside caller '{caller}' (args: {cs.args_count})")
+
+
+@main.group()
+def graph():
+    """Knowledge Graph Subcommands (FR-3.5)."""
+    pass
+
+
+@graph.command("query")
+@click.option("--repo", "-r", default=".", help="Path to repository.")
+@click.option("--node", "-n", required=True, help="Graph node ID to query e.g. 'main.py::main'.")
+@click.option("--relation", "-rel", type=click.Choice(["callers", "callees", "imports", "neighborhood"]), default="callers", help="Relationship traversal type.")
+def graph_query(repo: str, node: str, relation: str):
+    """Query structural graph relationships (callers, callees, imports, neighborhood) (FR-3.5)."""
+    config = IngestionConfig()
+    graph_path = Path(repo) / config.index_dir_name / "graph" / "repo_graph.graphml"
+
+    if not graph_path.exists():
+        click.echo(f"GraphML store not found at {graph_path}. Please run 'index' first.", err=True)
+        sys.exit(1)
+
+    G = GraphStore.load_graph(graph_path)
+    builder = GraphBuilder(G)
+
+    click.echo(f"=== Graph Query: Node '{node}' ({relation.upper()}) ===")
+
+    if not G.has_node(node):
+        click.echo(f"Node '{node}' not found in knowledge graph.", err=True)
+        click.echo(f"Available sample nodes: {list(G.nodes)[:5]}")
+        return
+
+    if relation == "callers":
+        callers = builder.get_callers(node)
+        click.echo(f"Direct Callers ({len(callers)}):")
+        for caller_id, data in callers:
+            click.echo(f"  - {caller_id} (Type: {data.get('type')}, File: {data.get('file_path')})")
+
+    elif relation == "callees":
+        callees = builder.get_callees(node)
+        click.echo(f"Direct Callees ({len(callees)}):")
+        for callee_id, data in callees:
+            click.echo(f"  - {callee_id} (Type: {data.get('type')}, File: {data.get('file_path')})")
+
+    elif relation == "imports":
+        imports = builder.get_imports(node)
+        click.echo(f"Imported Files ({len(imports)}):")
+        for imp_id, data in imports:
+            click.echo(f"  - {imp_id} (Language: {data.get('language')})")
+
+    elif relation == "neighborhood":
+        neighbors = builder.get_neighborhood([node], hops=1)
+        click.echo(f"1-Hop Structural Neighborhood ({len(neighbors)} nodes):")
+        for n_id in sorted(neighbors):
+            n_data = G.nodes.get(n_id, {})
+            click.echo(f"  - {n_id} (Type: {n_data.get('type', 'unknown')})")
 
 
 if __name__ == "__main__":
