@@ -7,6 +7,8 @@ from pathlib import Path
 import click
 
 from codebase_agent.config import IngestionConfig
+from codebase_agent.generation.citation_formatter import CitationFormatter
+from codebase_agent.generation.receiver import QueryReceiver
 from codebase_agent.graph.builder import GraphBuilder
 from codebase_agent.graph.store import GraphStore
 from codebase_agent.indexing.chunker import Chunker
@@ -317,13 +319,8 @@ def retrieve(query_text: str, repo: str, top_k: int, hops: int, threshold: float
 
     G = GraphStore.load_graph(graph_path)
 
-    # 1. Top-K Semantic Search (FR-5.2)
     semantic_chunks = retriever.retrieve(query_text=query_text, top_k=top_k)
-
-    # 2. Structural Graph Expansion (FR-5.3)
     expanded_chunks = expander.expand(semantic_chunks=semantic_chunks, G=G, hops=hops)
-
-    # 3. Context Assembly & Sufficiency Check (FR-5.6, Algorithm 3.7)
     result = assembler.assemble(query=query_text, semantic_chunks=semantic_chunks, expanded_chunks=expanded_chunks)
 
     click.echo(f"=== Hybrid Retrieval Engine Output ===")
@@ -340,6 +337,30 @@ def retrieve(query_text: str, repo: str, top_k: int, hops: int, threshold: float
         click.echo(f"\n[{idx}] {chunk.file_path}:{chunk.start_line}-{chunk.end_line} (Source: {chunk.source}, Score: {chunk.similarity_score})")
         click.echo(f"    Graph Node ID: {chunk.graph_node_id}")
         click.echo(f"    Snippet: {repr(chunk.document[:80])}...")
+
+
+@main.command("query")
+@click.argument("question")
+@click.option("--repo", "-r", default=".", help="Path to target repository.")
+@click.option("--model", "-m", default="qwen2.5-coder:7b", help="Local Ollama LLM model name (FR-8.1).")
+@click.option("--top-k", "-k", default=3, help="Top-K vector retrieval count.")
+@click.option("--threshold", default=0.3, help="Minimum similarity threshold score.")
+def query_command(question: str, repo: str, model: str, top_k: int, threshold: float):
+    """Answer natural language questions about codebase with verifiable file/line citations (FR-5.1 - FR-5.5)."""
+    receiver = QueryReceiver(
+        repo_dir=Path(repo),
+        model_name=model,
+        top_k=top_k,
+        similarity_threshold=threshold
+    )
+
+    response = receiver.process_query(question)
+
+    click.echo(f"=== Codebase Question Answering (Model: {response.model_name}) ===")
+    click.echo(f"Question: {response.query}\n")
+
+    output_text = CitationFormatter.render_output(response)
+    click.echo(output_text)
 
 
 if __name__ == "__main__":
