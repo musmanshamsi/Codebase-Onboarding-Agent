@@ -7,7 +7,7 @@ from codebase_agent.retrieval.models import RetrievedChunk, RetrievalResult
 class ContextAssembler:
     """Deduplicates, token-budgets, and checks sufficiency score threshold for prompt context."""
 
-    def __init__(self, max_context_tokens: int = 4096, similarity_threshold: float = 0.3):
+    def __init__(self, max_context_tokens: int = 4096, similarity_threshold: float = 0.38):
         self.max_context_tokens = max_context_tokens
         self.similarity_threshold = similarity_threshold
 

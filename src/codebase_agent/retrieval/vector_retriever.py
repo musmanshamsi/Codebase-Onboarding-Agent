@@ -9,16 +9,22 @@ from codebase_agent.indexing.embedder import Embedder
 from codebase_agent.retrieval.models import RetrievedChunk
 
 
+_CHROMA_CLIENTS = {}
+
+
 class VectorRetriever:
     """Performs semantic vector similarity search against ChromaDB collection."""
 
     def __init__(self, chroma_dir: Path, embedder: Optional[Embedder] = None):
         self.chroma_dir = chroma_dir
         self.embedder = embedder or Embedder()
-        self.client = chromadb.PersistentClient(
-            path=str(self.chroma_dir),
-            settings=Settings(anonymized_telemetry=False)
-        )
+        key = str(self.chroma_dir.resolve())
+        if key not in _CHROMA_CLIENTS:
+            _CHROMA_CLIENTS[key] = chromadb.PersistentClient(
+                path=key,
+                settings=Settings(anonymized_telemetry=False)
+            )
+        self.client = _CHROMA_CLIENTS[key]
         self.collection = self.client.get_or_create_collection(
             name="codebase_chunks",
             metadata={"hnsw:space": "cosine"}

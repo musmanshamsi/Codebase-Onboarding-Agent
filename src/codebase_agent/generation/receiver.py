@@ -21,10 +21,10 @@ class QueryReceiver:
     def __init__(
         self,
         repo_dir: Path,
-        model_name: str = "qwen2.5-coder:7b",
+        model_name: str = "qwen2.5-coder:1.5b",
         top_k: int = 3,
         hops: int = 1,
-        similarity_threshold: float = 0.3
+        similarity_threshold: float = 0.38
     ):
         self.repo_dir = repo_dir
         self.model_name = model_name
@@ -38,6 +38,34 @@ class QueryReceiver:
         self.graph_path = self.index_dir / "graph" / "repo_graph.graphml"
         self.db_path = self.index_dir / "cache.db"
 
+        self._retriever: Optional[VectorRetriever] = None
+        self._expander: Optional[GraphExpander] = None
+        self._assembler: Optional[ContextAssembler] = None
+        self._generator: Optional[LLMGenerator] = None
+        self._cache: Optional[MetadataCache] = None
+        self._G = None
+        self._graph_mtime = None
+
+    def _get_components(self):
+        if self._retriever is None:
+            self._retriever = VectorRetriever(chroma_dir=self.chroma_dir)
+        if self._expander is None:
+            self._expander = GraphExpander(chroma_dir=self.chroma_dir)
+        if self._assembler is None or self._assembler.similarity_threshold != self.similarity_threshold:
+            self._assembler = ContextAssembler(max_context_tokens=4096, similarity_threshold=self.similarity_threshold)
+        if self._generator is None or self._generator.model_name != self.model_name:
+            self._generator = LLMGenerator(model_name=self.model_name)
+        if self._cache is None:
+            self._cache = MetadataCache(db_path=self.db_path)
+
+        if self.graph_path.exists():
+            mtime = self.graph_path.stat().st_mtime
+            if self._G is None or self._graph_mtime != mtime:
+                self._G = GraphStore.load_graph(self.graph_path)
+                self._graph_mtime = mtime
+
+        return self._retriever, self._expander, self._assembler, self._generator, self._cache, self._G
+
     def process_query(self, question: str) -> QueryResponse:
         """Executes full query pipeline end-to-end (FR-5.1 - FR-5.6)."""
         if not self.chroma_dir.exists() or not self.graph_path.exists():
@@ -49,18 +77,12 @@ class QueryReceiver:
                 model_name=self.model_name
             )
 
-        # 1. Instantiate Pipeline Components
-        retriever = VectorRetriever(chroma_dir=self.chroma_dir)
-        expander = GraphExpander(chroma_dir=self.chroma_dir)
-        assembler = ContextAssembler(max_context_tokens=4096, similarity_threshold=self.similarity_threshold)
-        generator = LLMGenerator(model_name=self.model_name)
-        cache = MetadataCache(db_path=self.db_path)
-
-        G = GraphStore.load_graph(self.graph_path)
+        # 1. Fetch Cached Pipeline Components
+        retriever, expander, assembler, generator, cache, G = self._get_components()
 
         # 2. Hybrid Retrieval (Semantic + Graph Expansion)
         semantic_chunks = retriever.retrieve(query_text=question, top_k=self.top_k)
-        expanded_chunks = expander.expand(semantic_chunks=semantic_chunks, G=G, hops=self.hops)
+        expanded_chunks = expander.expand(semantic_chunks=semantic_chunks, G=G if G is not None else GraphStore.load_graph(self.graph_path), hops=self.hops)
 
         # 3. Context Assembly & Sufficiency Check (FR-5.6)
         retrieval_res = assembler.assemble(query=question, semantic_chunks=semantic_chunks, expanded_chunks=expanded_chunks)

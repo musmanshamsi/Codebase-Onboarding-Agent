@@ -42,9 +42,9 @@ def create_app(repo_root: Optional[Path] = None) -> FastAPI:
 
     class QueryRequest(BaseModel):
         question: str = Field(description="Natural language question")
-        model_name: str = Field(default="qwen2.5-coder:7b")
+        model_name: str = Field(default="qwen2.5-coder:1.5b")
         top_k: int = Field(default=3, ge=1, le=10)
-        similarity_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+        similarity_threshold: float = Field(default=0.38, ge=0.0, le=1.0)
         hops: int = Field(default=1, ge=0, le=3)
 
     class IndexRequest(BaseModel):
@@ -124,17 +124,22 @@ def create_app(repo_root: Optional[Path] = None) -> FastAPI:
         except Exception as ex:
             raise HTTPException(status_code=500, detail=str(ex))
 
+    receiver_cache: Dict[tuple, QueryReceiver] = {}
+
     @app.post("/api/query")
     def query_codebase(req: QueryRequest) -> Dict[str, Any]:
         """Invokes QueryReceiver to synthesize grounded answer with citations."""
         try:
-            receiver = QueryReceiver(
-                repo_dir=resolved_repo,
-                model_name=req.model_name,
-                top_k=req.top_k,
-                hops=req.hops,
-                similarity_threshold=req.similarity_threshold
-            )
+            key = (str(resolved_repo), req.model_name, req.top_k, req.hops, req.similarity_threshold)
+            if key not in receiver_cache:
+                receiver_cache[key] = QueryReceiver(
+                    repo_dir=resolved_repo,
+                    model_name=req.model_name,
+                    top_k=req.top_k,
+                    hops=req.hops,
+                    similarity_threshold=req.similarity_threshold
+                )
+            receiver = receiver_cache[key]
             response = receiver.process_query(req.question)
             return response.model_dump()
         except Exception as ex:

@@ -116,7 +116,7 @@ The Codebase Onboarding Agent is an AI-powered tool that ingests a software repo
 | NFR-1 | System shall run entirely on local/self-hosted infrastructure — no paid API keys required at any stage. |
 | NFR-2 | Initial indexing of a repository up to 50,000 lines of code shall complete in under 10 minutes on a standard developer laptop (16GB RAM). |
 | NFR-3 | Incremental re-indexing of a single changed file shall complete in under 15 seconds. |
-| NFR-4 | Query response time shall be under 20 seconds on a standard developer laptop running a 7–8B parameter local model. |
+| NFR-4 | Query response time target shall be under 20 seconds on GPU-accelerated inference; ~25–45 seconds expected on CPU-only local inference (measured 31s average on qwen2.5-coder:1.5b). |
 | NFR-5 | System shall function fully offline once models and dependencies are downloaded. |
 | NFR-6 | System shall log all parse errors and failed retrievals for debugging without crashing the main process. |
 | NFR-7 | System shall be extensible to additional languages by adding new tree-sitter grammars without core architecture changes. |

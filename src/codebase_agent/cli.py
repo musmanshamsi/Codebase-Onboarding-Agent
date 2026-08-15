@@ -276,9 +276,9 @@ def retrieve(query_text: str, repo: str, top_k: int, hops: int, threshold: float
 @main.command("query")
 @click.argument("question")
 @click.option("--repo", "-r", default=".", help="Path to target repository.")
-@click.option("--model", "-m", default="qwen2.5-coder:7b", help="Local Ollama LLM model name (FR-8.1).")
+@click.option("--model", "-m", default="qwen2.5-coder:1.5b", help="Local Ollama LLM model name (FR-8.1).")
 @click.option("--top-k", "-k", default=3, help="Top-K vector retrieval count.")
-@click.option("--threshold", default=0.3, help="Minimum similarity threshold score.")
+@click.option("--threshold", default=0.38, help="Minimum similarity threshold score.")
 def query_command(question: str, repo: str, model: str, top_k: int, threshold: float):
     """Answer natural language questions about codebase with verifiable file/line citations (FR-5.1 - FR-5.5)."""
     receiver = QueryReceiver(

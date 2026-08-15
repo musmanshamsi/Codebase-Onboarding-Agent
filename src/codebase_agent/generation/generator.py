@@ -20,7 +20,7 @@ class LLMGenerator:
 
     def __init__(
         self,
-        model_name: str = "qwen2.5-coder:7b",
+        model_name: str = "qwen2.5-coder:1.5b",
         ollama_url: str = "http://localhost:11434"
     ):
         self.model_name = model_name
@@ -55,8 +55,11 @@ class LLMGenerator:
                 {"role": "user", "content": context_text}
             ],
             "stream": False,
+            "keep_alive": "10m",
             "options": {
-                "temperature": 0.1
+                "temperature": 0.1,
+                "num_predict": 512,
+                "num_ctx": 2048
             }
         }
 

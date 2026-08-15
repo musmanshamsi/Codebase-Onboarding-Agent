@@ -10,15 +10,21 @@ from codebase_agent.graph.builder import GraphBuilder
 from codebase_agent.retrieval.models import RetrievedChunk
 
 
+from codebase_agent.retrieval.vector_retriever import _CHROMA_CLIENTS
+
+
 class GraphExpander:
     """Enriches semantically retrieved chunks with structurally connected neighborhood code."""
 
     def __init__(self, chroma_dir: Path):
         self.chroma_dir = chroma_dir
-        self.client = chromadb.PersistentClient(
-            path=str(self.chroma_dir),
-            settings=Settings(anonymized_telemetry=False)
-        )
+        key = str(self.chroma_dir.resolve())
+        if key not in _CHROMA_CLIENTS:
+            _CHROMA_CLIENTS[key] = chromadb.PersistentClient(
+                path=key,
+                settings=Settings(anonymized_telemetry=False)
+            )
+        self.client = _CHROMA_CLIENTS[key]
         self.collection = self.client.get_or_create_collection(
             name="codebase_chunks",
             metadata={"hnsw:space": "cosine"}
